@@ -1,0 +1,8 @@
+coverage/
+dist/
+node_modules/
+package-lock.json
+
+# Existing authored documents are not reformatted by the code formatter.
+docs/*.md
+tmp*
