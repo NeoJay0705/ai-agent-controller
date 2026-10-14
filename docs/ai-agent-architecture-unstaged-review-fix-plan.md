@@ -1,3 +1,7 @@
+> **歷史標記（已取代）：** 本修正計畫依據先前 Enterprise AI Agent 架構，不是目前實作指示。請改以[Telegram 控制器需求](telegram-controller-requirements.md)與[Telegram 控制器架構設計](telegram-controller-design.md)為準。原文保留。
+>
+> ---
+
 # AI Agent unstaged changes 必要修正計畫
 
 - **狀態：** Ready for implementation

@@ -1,3 +1,7 @@
+> **歷史標記（已取代）：** 本文件記錄先前 Enterprise AI Agent 範圍，不再作為目前需求或實作基準。請改以[Telegram 控制器需求](telegram-controller-requirements.md)與[Telegram 控制器架構設計](telegram-controller-design.md)為準。原文保留。
+>
+> ---
+
 # Enterprise AI Agent — System Requirements v0.1
 
 **Status:** Draft
