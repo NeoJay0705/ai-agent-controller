@@ -83,6 +83,13 @@ export interface JsonObject {
  * Runtime boundary for a controlled Pi adapter. Results are structured data;
  * transition selection is never inferred from prose.
  */
+export interface UsageBudget {
+  readonly limitTokens: number;
+  readonly onRequestStarted: (sequence: number) => void;
+  readonly onUsage: (sequence: number, totalTokens: number) => void;
+  readonly onSettled: (complete: boolean) => void;
+}
+
 export interface AgentRuntime {
   run(input: {
     readonly controllerSessionId: string;
@@ -93,6 +100,7 @@ export interface AgentRuntime {
     readonly state: JsonValue;
     readonly historyFacts: readonly JsonValue[];
     readonly signal: AbortSignal;
+    readonly usageBudget?: UsageBudget;
   }): Promise<AgentNodeResult>;
   dispose(): Promise<void>;
 }

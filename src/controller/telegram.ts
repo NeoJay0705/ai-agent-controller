@@ -29,6 +29,17 @@ export class TelegramError extends Error {
 
 export type FetchLike = typeof fetch;
 
+export interface TelegramCommand {
+  readonly command: string;
+  readonly description: string;
+}
+
+export function canonicalBotUsername(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const match = /^[A-Za-z0-9_]{5,32}$/.exec(value);
+  return match !== null && match[0] === value ? value : null;
+}
+
 export class TelegramClient {
   private readonly token: string;
   private readonly fetcher: FetchLike;
@@ -36,6 +47,34 @@ export class TelegramClient {
   constructor(token: string, fetcher: FetchLike = fetch) {
     this.token = token;
     this.fetcher = fetcher;
+  }
+
+  async getMe(signal: AbortSignal): Promise<string> {
+    const result = await this.request<unknown>('getMe', {}, signal, 10_000);
+    if (!isRecord(result)) throw new TelegramError('transient');
+    const username = canonicalBotUsername(result['username']);
+    if (username === null) throw new TelegramError('transient');
+    return username;
+  }
+
+  async setMyCommands(
+    commands: readonly TelegramCommand[],
+    chatId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const body: Record<string, unknown> = { commands };
+    if (chatId !== undefined) {
+      const numericChat = positiveSafeInteger(Number(chatId));
+      if (numericChat === null) throw new TelegramError('permanent');
+      body['scope'] = { type: 'chat', chat_id: numericChat };
+    }
+    const result = await this.request<unknown>(
+      'setMyCommands',
+      body,
+      signal,
+      10_000,
+    );
+    if (result !== true) throw new TelegramError('transient');
   }
 
   async getUpdates(
@@ -82,7 +121,7 @@ export class TelegramClient {
   }
 
   private async request<T>(
-    method: 'getUpdates' | 'sendMessage',
+    method: 'getUpdates' | 'sendMessage' | 'getMe' | 'setMyCommands',
     body: Readonly<Record<string, unknown>>,
     signal: AbortSignal,
     timeoutMs: number,

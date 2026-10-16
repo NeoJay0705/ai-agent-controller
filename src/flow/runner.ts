@@ -6,6 +6,8 @@ export interface FlowRunnerOptions {
   readonly concurrency: number;
   readonly now?: () => number;
   readonly onError?: (error: Error) => void;
+  readonly canRunOwner?: (ownerId: string) => boolean;
+  readonly maxWorkersPerOwner?: (ownerId: string) => number;
 }
 
 interface Worker {
@@ -30,6 +32,8 @@ export class FlowRunner {
   private readonly concurrency: number;
   private readonly now: () => number;
   private readonly onError: (error: Error) => void;
+  private readonly canRunOwner: (ownerId: string) => boolean;
+  private readonly maxWorkersPerOwner: (ownerId: string) => number;
   private readonly workers = new Map<string, Worker>();
   private stopped = false;
   private stopPromise: Promise<void> | null = null;
@@ -51,6 +55,9 @@ export class FlowRunner {
     this.concurrency = options.concurrency;
     this.now = options.now ?? Date.now;
     this.onError = options.onError ?? (() => undefined);
+    this.canRunOwner = options.canRunOwner ?? (() => true);
+    this.maxWorkersPerOwner =
+      options.maxWorkersPerOwner ?? (() => Number.MAX_SAFE_INTEGER);
   }
 
   tick(): void {
@@ -70,7 +77,24 @@ export class FlowRunner {
     );
     let reserved;
     try {
-      reserved = this.flowStore.reserveReadyJobs(now, slots, excludedSessions);
+      const ownerCounts = new Map<string, number>();
+      for (const worker of this.workers.values())
+        ownerCounts.set(
+          worker.ownerId,
+          (ownerCounts.get(worker.ownerId) ?? 0) + 1,
+        );
+      reserved = this.flowStore.reserveReadyJobs(
+        now,
+        slots,
+        excludedSessions,
+        (ownerId) => {
+          if (!this.canRunOwner(ownerId)) return false;
+          const count = ownerCounts.get(ownerId) ?? 0;
+          if (count >= this.maxWorkersPerOwner(ownerId)) return false;
+          ownerCounts.set(ownerId, count + 1);
+          return true;
+        },
+      );
     } catch {
       this.report('FLOW_SCHEDULER_FAILED');
       return;
@@ -99,9 +123,21 @@ export class FlowRunner {
           this.report(executionFailureCode(error) ?? 'FLOW_EXECUTION_FAILED');
         })
         .finally(() => {
-          if (this.workers.get(reservation.jobId) === worker) {
-            this.workers.delete(reservation.jobId);
+          try {
+            const latest = this.controllerStore.statusForJob(
+              worker.ownerId,
+              reservation.jobId,
+            );
+            if (latest?.status === 'CANCELLING')
+              this.controllerStore.transaction(() =>
+                this.controllerStore.finishCancellation(reservation.jobId),
+              );
+          } catch {
+            this.report('FLOW_STORAGE_INVALID');
+            return;
           }
+          if (this.workers.get(reservation.jobId) === worker)
+            this.workers.delete(reservation.jobId);
         });
       this.workers.set(reservation.jobId, worker);
     }
@@ -137,7 +173,16 @@ export class FlowRunner {
         }
         continue;
       }
-      if (job.status === 'COMPLETED' || job.status === 'FAILED') {
+      if (job.status === 'CANCELLING') {
+        if (!worker.controller.signal.aborted)
+          worker.controller.abort('JOB_CANCELLED');
+        continue;
+      }
+      if (
+        job.status === 'COMPLETED' ||
+        job.status === 'FAILED' ||
+        job.status === 'CANCELLED'
+      ) {
         if (!worker.controller.signal.aborted) {
           worker.controller.abort('RUNNER_STOPPED');
         }

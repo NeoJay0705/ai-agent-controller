@@ -232,6 +232,15 @@ describe('controller service real loops', () => {
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
       methods.push(method);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      methods.push(method);
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') {
         offsets.push(Number(bodyOf(init)['offset']));
         return offsets.length === 1
@@ -282,7 +291,9 @@ describe('controller service real loops', () => {
           .all(),
       ).toEqual([{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }]);
       expect(offsets.slice(0, 2)).toEqual([0, 4]);
-      expect(new Set(methods)).toEqual(new Set(['getUpdates', 'sendMessage']));
+      expect(new Set(methods)).toEqual(
+        new Set(['getUpdates', 'sendMessage', 'getMe', 'setMyCommands']),
+      );
     } finally {
       await service?.stop();
       await removeDirectory(dataDir);
@@ -309,6 +320,14 @@ describe('controller service real loops', () => {
     let service: ControllerService | undefined;
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') {
         offsets.push(Number(bodyOf(init)['offset']));
         if (offsets.length === 1)
@@ -389,6 +408,15 @@ describe('controller service real loops', () => {
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
       methods.push(method);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      methods.push(method);
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') {
         offsets.push(Number(bodyOf(init)['offset']));
         if (offsets.length === 1) {
@@ -554,7 +582,9 @@ describe('controller service real loops', () => {
         resources.store.statusForSession(USER_ID, CHAT_ID)?.[0],
       ).toMatchObject({ status: 'COMPLETED' });
       expect(sentBodies.length).toBeGreaterThanOrEqual(4);
-      expect(new Set(methods)).toEqual(new Set(['getUpdates', 'sendMessage']));
+      expect(new Set(methods)).toEqual(
+        new Set(['getUpdates', 'sendMessage', 'getMe', 'setMyCommands']),
+      );
     } finally {
       await service?.stop();
       await removeDirectory(dataDir);
@@ -576,6 +606,14 @@ describe('controller service real loops', () => {
     let service: ControllerService | undefined;
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') {
         offsets += 1;
         return offsets === 1
@@ -643,6 +681,14 @@ describe('controller service real loops', () => {
     let service: ControllerService | undefined;
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') {
         offsets += 1;
         return offsets === 1
@@ -754,6 +800,15 @@ describe('controller service real loops', () => {
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
       methods.push(method);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      methods.push(method);
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') {
         offsets += 1;
         return offsets === 1
@@ -870,6 +925,16 @@ describe('controller service real loops', () => {
       const fetcher: FetchLike = (input, init) => {
         const method = methodName(input);
         methods.push(method);
+        if (method === 'getMe')
+          return jsonResponse({
+            id: 123456,
+            is_bot: true,
+            first_name: 'Synthetic',
+            username: 'synthetic_bot',
+          });
+        methods.push(method);
+        if (method === 'setMyCommands') return jsonResponse(true);
+        methods.push(method);
         if (method === 'getUpdates') {
           pollCount += 1;
           if (pollCount === 1) {
@@ -956,7 +1021,7 @@ describe('controller service real loops', () => {
         expect(methods).toContain('sendMessage');
         expect(methods).not.toContain('deleteWebhook');
         expect(new Set(methods)).toEqual(
-          new Set(['getUpdates', 'sendMessage']),
+          new Set(['getUpdates', 'sendMessage', 'getMe', 'setMyCommands']),
         );
 
         const reopened = new ControllerStore(
@@ -1038,6 +1103,14 @@ describe('controller service real loops', () => {
     let service: ControllerService | undefined;
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') return updateResponse(updates.splice(0));
       if (method !== 'sendMessage')
         throw new Error(`Unexpected Telegram API method ${method}.`);
@@ -1146,6 +1219,14 @@ describe('controller service real loops', () => {
     let service: ControllerService | undefined;
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') return updateResponse([]);
       if (method !== 'sendMessage')
         throw new Error(`Unexpected Telegram API method ${method}.`);
@@ -1187,6 +1268,7 @@ describe('controller service real loops', () => {
         attempts: 0,
         chatId: CHAT_ID,
         promptGeneration: 0,
+        deliveryClass: 'business' as const,
       };
       resources.store.dueOutbox = () => {
         dueSnapshots += 1;
@@ -1345,6 +1427,15 @@ describe('controller service real loops', () => {
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
       methods.push(method);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      methods.push(method);
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') return updateResponse(updates.splice(0));
       if (method !== 'sendMessage')
         throw new Error(`Unexpected Telegram API method ${method}.`);
@@ -1450,7 +1541,9 @@ describe('controller service real loops', () => {
           )
           .get(),
       ).toMatchObject({ count: 0 });
-      expect(new Set(methods)).toEqual(new Set(['getUpdates', 'sendMessage']));
+      expect(new Set(methods)).toEqual(
+        new Set(['getUpdates', 'sendMessage', 'getMe', 'setMyCommands']),
+      );
     } finally {
       await service?.stop();
       await removeDirectory(dataDir);

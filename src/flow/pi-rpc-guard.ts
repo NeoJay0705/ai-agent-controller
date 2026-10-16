@@ -12,6 +12,7 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 
 import { calculateNatalChart, validateBirthChartInput } from './natal.js';
+import { normalizeUsage } from './token-usage.js';
 import type { FlowLimits, JsonValue } from './types.js';
 
 const MAX_CONFIG_BYTES = 64 * 1024;
@@ -51,6 +52,7 @@ interface GuardConfig {
   readonly thinking: string;
   readonly tools: readonly string[];
   readonly effectiveLimits: FlowLimits;
+  readonly tokenBudget?: number;
   readonly auth?: {
     readonly mode: 'pi-login';
     readonly expiresAt: number;
@@ -96,6 +98,10 @@ export default async function flowHostGuard(pi: ExtensionAPI): Promise<void> {
   let turnCount = 0;
   let toolCallCount = 0;
   let outputChars = 0;
+  let usageSequence = 0;
+  let usageOutstanding = false;
+  let usageKnown = true;
+  let usageSpent = 0;
 
   const fail = (code: GuardFailureCode, context: ExtensionContext): void => {
     if (failureCode === undefined) failureCode = code;
@@ -226,7 +232,27 @@ export default async function flowHostGuard(pi: ExtensionAPI): Promise<void> {
   pi.on('before_provider_request', (_event, context) => {
     if (config.auth !== undefined && !oauthSnapshotHasValidity(config)) {
       fail('FLOW_AUTH_SNAPSHOT_INVALID', context);
+      return;
     }
+    if (config.tokenBudget === undefined) return;
+    if (!usageKnown || usageOutstanding) {
+      fail('FLOW_USAGE_UNKNOWN', context);
+      return;
+    }
+    if (usageSpent >= config.tokenBudget) {
+      fail('FLOW_TOKEN_LIMIT', context);
+      return;
+    }
+    usageSequence += 1;
+    usageOutstanding = true;
+    context.ui.notify(
+      JSON.stringify({
+        tag: 'flow-host-request',
+        nonce: config.nonce,
+        sequence: usageSequence,
+      }),
+      'info',
+    );
   });
 
   pi.on('before_agent_start', (event, context) => {
@@ -309,6 +335,34 @@ export default async function flowHostGuard(pi: ExtensionAPI): Promise<void> {
   pi.on('message_end', (event, context) => {
     const message = event.message;
     if (message.role !== 'user' && message.role !== 'assistant') return;
+    if (message.role === 'assistant' && config.tokenBudget !== undefined) {
+      const usage = normalizeUsage(
+        (message as unknown as Record<string, unknown>)['usage'],
+      );
+      const incompleteStop =
+        message.stopReason === 'error' || message.stopReason === 'aborted';
+      if (
+        usage === null ||
+        !usageOutstanding ||
+        !Number.isSafeInteger(usageSpent + usage.totalTokens)
+      ) {
+        usageKnown = false;
+        fail('FLOW_USAGE_UNKNOWN', context);
+      } else {
+        usageSpent += usage.totalTokens;
+        usageOutstanding = false;
+        if (incompleteStop) usageKnown = false;
+        context.ui.notify(
+          JSON.stringify({
+            tag: 'flow-host-usage',
+            nonce: config.nonce,
+            sequence: usageSequence,
+            totalTokens: usage.totalTokens,
+          }),
+          'info',
+        );
+      }
+    }
     const serialized = safeStringify(message);
     const hasSecret = hasCredential(serialized, currentCredential);
     const assistant = message.role === 'assistant';
@@ -354,7 +408,19 @@ export default async function flowHostGuard(pi: ExtensionAPI): Promise<void> {
     };
   });
 
-  pi.on('agent_settled', () => {
+  pi.on('agent_settled', (_event, context) => {
+    if (config.tokenBudget !== undefined) {
+      const complete = usageKnown && !usageOutstanding && usageSequence > 0;
+      context.ui.notify(
+        JSON.stringify({
+          tag: 'flow-host-usage-settled',
+          nonce: config.nonce,
+          complete,
+        }),
+        'info',
+      );
+      if (!complete) fail('FLOW_USAGE_UNKNOWN', context);
+    }
     jobData = undefined;
   });
 }
@@ -372,7 +438,9 @@ type GuardFailureCode =
   | 'FLOW_TOOL_FORBIDDEN'
   | 'FLOW_TOOL_LIMIT'
   | 'FLOW_TOOL_INPUT_INVALID'
-  | 'FLOW_TOOL_OUTPUT_LIMIT';
+  | 'FLOW_TOOL_OUTPUT_LIMIT'
+  | 'FLOW_TOKEN_LIMIT'
+  | 'FLOW_USAGE_UNKNOWN';
 
 async function readGuardConfig(path: string): Promise<GuardConfig> {
   try {
@@ -410,9 +478,10 @@ function isGuardConfig(value: unknown): value is GuardConfig {
         'tools',
         'effectiveLimits',
         'auth',
+        'tokenBudget',
         'node',
       ],
-      ['auth'],
+      ['auth', 'tokenBudget'],
     ) ||
     value['version'] !== 1 ||
     typeof value['nonce'] !== 'string' ||
@@ -450,6 +519,14 @@ function isGuardConfig(value: unknown): value is GuardConfig {
   ) {
     return false;
   }
+  const tokenBudget = value['tokenBudget'];
+  if (
+    tokenBudget !== undefined &&
+    (!Number.isSafeInteger(tokenBudget) ||
+      (tokenBudget as number) <= 0 ||
+      (tokenBudget as number) > 1_000_000_000)
+  )
+    return false;
   const auth = value['auth'];
   if (
     auth !== undefined &&

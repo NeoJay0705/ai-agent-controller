@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   TelegramClient,
   TelegramError,
+  canonicalBotUsername,
 } from '../../src/controller/telegram.js';
 import type { FetchLike } from '../../src/controller/telegram.js';
 
@@ -43,6 +44,65 @@ afterEach(() => {
 });
 
 describe('Telegram HTTP client protocol handling', () => {
+  it('rejects usernames with trailing Unicode line separators', () => {
+    for (const suffix of [
+      String.fromCharCode(10),
+      String.fromCharCode(13),
+      String.fromCharCode(0x2028),
+      String.fromCharCode(0x2029),
+    ])
+      expect(canonicalBotUsername(`safe_bot${suffix}`)).toBeNull();
+    expect(canonicalBotUsername('safe_bot')).toBe('safe_bot');
+  });
+  it('validates getMe usernames and registers default or chat-scoped commands', async () => {
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const client = new TelegramClient(TOKEN, (input, init) => {
+      const url = requestUrlString(input);
+      if (typeof init?.body !== 'string')
+        throw new Error('Expected JSON request body.');
+      const body = JSON.parse(init.body) as Record<string, unknown>;
+      requests.push({ url, body });
+      const method = url.split('/').at(-1);
+      return response({
+        ok: true,
+        result: method === 'getMe' ? { id: 9, username: 'safe_bot' } : true,
+      });
+    });
+    const signal = new AbortController().signal;
+    await expect(client.getMe(signal)).resolves.toBe('safe_bot');
+    await client.setMyCommands(
+      [{ command: 'help', description: 'Show help' }],
+      undefined,
+      signal,
+    );
+    await client.setMyCommands(
+      [{ command: 'help', description: 'Show help' }],
+      '12345',
+      signal,
+    );
+    expect(requests.map((r) => r.url)).toEqual([
+      `https://api.telegram.org/bot${TOKEN}/getMe`,
+      `https://api.telegram.org/bot${TOKEN}/setMyCommands`,
+      `https://api.telegram.org/bot${TOKEN}/setMyCommands`,
+    ]);
+    expect(requests[1]?.body).toEqual({
+      commands: [{ command: 'help', description: 'Show help' }],
+    });
+    expect(requests[2]?.body).toMatchObject({
+      scope: { type: 'chat', chat_id: 12345 },
+    });
+    await expect(
+      new TelegramClient(TOKEN, () =>
+        response({ ok: true, result: { id: 1, username: 'bad-name' } }),
+      ).getMe(signal),
+    ).rejects.toMatchObject({ kind: 'transient' });
+    await expect(
+      new TelegramClient(TOKEN, () =>
+        response({ ok: true, result: false }),
+      ).setMyCommands([], undefined, signal),
+    ).rejects.toMatchObject({ kind: 'transient' });
+  });
+
   it('posts long-poll settings, validates response shape, and sorts updates', async () => {
     let requestUrl = '';
     let requestBody: Record<string, unknown> = {};

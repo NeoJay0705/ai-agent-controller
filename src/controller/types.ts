@@ -1,7 +1,14 @@
 import type { DatabaseSync } from 'node:sqlite';
+import type { TrialPolicy } from './trial-policy.js';
 
 export type JobStatus =
-  'QUEUED' | 'RUNNING' | 'WAITING_INPUT' | 'COMPLETED' | 'FAILED';
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'WAITING_INPUT'
+  | 'CANCELLING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
 
 export type SteeringStatus = 'pending' | 'applied' | 'not_applied';
 export type OutboxStatus = 'PENDING' | 'DELIVERED' | 'FAILED';
@@ -32,6 +39,7 @@ export type ControllerConfig = ControllerConfigCommon &
         readonly allowedUserId: string;
         readonly flowConfigPath: string;
         readonly piAuthFile?: string;
+        readonly trial?: TrialPolicy;
       }
   );
 
@@ -99,6 +107,7 @@ export interface OutboxRecord {
   readonly attempts: number;
   readonly chatId: string;
   readonly promptGeneration: number | null;
+  readonly deliveryClass: 'business' | 'control';
 }
 
 export interface PromptRecord {

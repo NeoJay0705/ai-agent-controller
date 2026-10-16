@@ -116,12 +116,31 @@ export class MockTelegramTransport {
       url.hash !== '' ||
       url.pathname !== `/bot${this.token}/${endpoint}` ||
       init?.method !== 'POST' ||
-      (endpoint !== 'getUpdates' && endpoint !== 'sendMessage')
+      !['getUpdates', 'sendMessage', 'getMe', 'setMyCommands'].includes(
+        endpoint,
+      )
     ) {
       throw new LiveHarnessError('TRANSPORT_REJECTED', 'transport');
     }
     this.methods.push(endpoint);
     if (init.signal?.aborted) return new Response('', { status: 200 });
+    if (endpoint === 'getMe')
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          result: {
+            id: 123456,
+            is_bot: true,
+            first_name: 'Synthetic',
+            username: 'synthetic_bot',
+          },
+        }),
+        { status: 200 },
+      );
+    if (endpoint === 'setMyCommands')
+      return new Response(JSON.stringify({ ok: true, result: true }), {
+        status: 200,
+      });
     if (endpoint === 'getUpdates') {
       await this.abortableTurn(init.signal ?? undefined);
       return new Response(

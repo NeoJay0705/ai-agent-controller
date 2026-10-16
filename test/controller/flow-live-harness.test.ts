@@ -84,6 +84,10 @@ describe('live-model test safety helpers (offline only)', () => {
       telegram.fetcher,
     );
     const signal = new AbortController().signal;
+    await expect(client.getMe(signal)).resolves.toBe('synthetic_bot');
+    await expect(
+      client.setMyCommands([], '515151', signal),
+    ).resolves.toBeUndefined();
     await expect(
       client.sendMessage('424242', 'READY', signal),
     ).resolves.toMatchObject({
@@ -103,6 +107,8 @@ describe('live-model test safety helpers (offline only)', () => {
       'getUpdates',
       'getUpdates',
       'sendMessage',
+      'getMe',
+      'setMyCommands',
       'sendMessage',
       'sendMessage',
       'sendMessage',

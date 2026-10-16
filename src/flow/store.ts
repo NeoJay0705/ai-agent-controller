@@ -407,6 +407,11 @@ export class FlowStore {
     now: number,
     slots: number,
     excludedSessionIds: ReadonlySet<string> = new Set(),
+    canReserve: (
+      ownerId: string,
+      sessionId: string,
+      jobId: string,
+    ) => boolean = () => true,
   ): readonly ReservedFlowJob[] {
     if (
       !Number.isSafeInteger(now) ||
@@ -421,7 +426,7 @@ export class FlowStore {
       const reserved: ReservedFlowJob[] = [];
       const waiting = this.store.database
         .prepare(
-          `SELECT j.id, j.session_id FROM jobs j
+          `SELECT j.id, j.session_id, j.owner_id FROM jobs j
            WHERE j.status='WAITING_INPUT'
              AND EXISTS (SELECT 1 FROM messages m WHERE m.job_id=j.id
                          AND m.kind='steering' AND m.steering_state='pending')
@@ -430,12 +435,18 @@ export class FlowStore {
                              AND f.wait_deadline IS NOT NULL AND f.wait_deadline<=?)
            ORDER BY j.created_at, j.sequence`,
         )
-        .all(now, now) as { id: unknown; session_id: unknown }[];
+        .all(now, now) as {
+        id: unknown;
+        session_id: unknown;
+        owner_id: unknown;
+      }[];
       for (const row of waiting) {
         if (reserved.length >= slots) break;
         const jobId = asString(row.id, 'job ID');
         const sessionId = asString(row.session_id, 'job session ID');
-        if (occupied.has(sessionId)) continue;
+        const ownerId = asString(row.owner_id, 'job owner ID');
+        if (occupied.has(sessionId) || !canReserve(ownerId, sessionId, jobId))
+          continue;
         const run = this.getPinnedFlowRun(jobId);
         if (run === null) continue;
         const changed = this.store.database
@@ -458,11 +469,11 @@ export class FlowStore {
       if (reserved.length < slots) {
         const queued = this.store.database
           .prepare(
-            `SELECT j.id, j.session_id, j.input, j.deadline_at
+            `SELECT j.id, j.session_id, j.owner_id, j.input, j.deadline_at
              FROM jobs j WHERE j.status='QUEUED'
                AND NOT EXISTS (SELECT 1 FROM jobs active
                  WHERE active.session_id=j.session_id
-                   AND active.status IN ('RUNNING','WAITING_INPUT'))
+                   AND active.status IN ('RUNNING','WAITING_INPUT','CANCELLING'))
                AND NOT EXISTS (SELECT 1 FROM jobs earlier
                  WHERE earlier.session_id=j.session_id AND earlier.status='QUEUED'
                    AND earlier.sequence<j.sequence)
@@ -473,7 +484,9 @@ export class FlowStore {
           if (reserved.length >= slots) break;
           const jobId = asString(row['id'], 'job ID');
           const sessionId = asString(row['session_id'], 'job session ID');
-          if (occupied.has(sessionId)) continue;
+          const ownerId = asString(row['owner_id'], 'job owner ID');
+          if (occupied.has(sessionId) || !canReserve(ownerId, sessionId, jobId))
+            continue;
           const context = this.getJobContext(jobId);
           if (context === null || context.status !== 'QUEUED') continue;
           const initialState = createInitialExecutionState({
@@ -863,6 +876,13 @@ export class FlowStore {
       ) {
         return { status: 'stale', run: current };
       }
+      const job = this.store.database
+        .prepare('SELECT status FROM jobs WHERE id=?')
+        .get(input.jobId) as { status?: unknown } | undefined;
+      if (job === undefined)
+        throw new DomainError('NOT_FOUND', 'Job not found.');
+      if (asJobStatus(job.status) !== 'RUNNING')
+        return { status: 'stale', run: current };
       const registry = this.registryFor(current.bundle);
       const flow = registry.get(current.flowId);
       const node = registry.getNode(current.flowId, current.nodeId);
@@ -1103,7 +1123,12 @@ export class FlowStore {
       if (job === undefined)
         throw new DomainError('NOT_FOUND', 'Job not found.');
       const jobStatus = asJobStatus(job.status);
-      if (jobStatus === 'COMPLETED' || jobStatus === 'FAILED') {
+      if (
+        jobStatus === 'COMPLETED' ||
+        jobStatus === 'FAILED' ||
+        jobStatus === 'CANCELLED' ||
+        jobStatus === 'CANCELLING'
+      ) {
         return { status: 'stale', run: current };
       }
       if (input.outcome === 'complete' || currentNode.kind === 'agent') {
@@ -1281,6 +1306,13 @@ export class FlowStore {
   restartTerminateAll(): number {
     return this.transaction(() => {
       const now = this.now();
+      const cancelling = this.store.database
+        .prepare(
+          "SELECT id FROM jobs WHERE status='CANCELLING' ORDER BY created_at, sequence",
+        )
+        .all() as { id: unknown }[];
+      for (const row of cancelling)
+        this.store.finishCancellation(asString(row.id, 'job ID'));
       const active = this.store.database
         .prepare(
           "SELECT id FROM jobs WHERE status IN ('QUEUED','RUNNING','WAITING_INPUT') ORDER BY created_at, sequence",
@@ -1311,7 +1343,7 @@ export class FlowStore {
       const terminalWithPrompts = this.store.database
         .prepare(
           `SELECT DISTINCT j.id FROM jobs j JOIN outbox o ON o.job_id=j.id
-           WHERE j.status IN ('COMPLETED','FAILED') AND o.kind='prompt' AND o.status='PENDING'`,
+           WHERE j.status IN ('COMPLETED','FAILED','CANCELLED') AND o.kind='prompt' AND o.status='PENDING'`,
         )
         .all() as { id: unknown }[];
       for (const row of terminalWithPrompts) {
@@ -1753,8 +1785,10 @@ function asJobStatus(value: unknown): JobStatus {
     value !== 'QUEUED' &&
     value !== 'RUNNING' &&
     value !== 'WAITING_INPUT' &&
+    value !== 'CANCELLING' &&
     value !== 'COMPLETED' &&
-    value !== 'FAILED'
+    value !== 'FAILED' &&
+    value !== 'CANCELLED'
   ) {
     throw new DomainError('FLOW_STORAGE_INVALID', 'Job status is invalid.');
   }

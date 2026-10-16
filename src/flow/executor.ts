@@ -124,6 +124,10 @@ const STABLE_RUNTIME_CODES = new Set([
   'FLOW_MODEL_REQUEST_FAILED',
   'FLOW_RESULT_INVALID',
   'FLOW_RUNTIME_DISPOSED',
+  'FLOW_TOKEN_LIMIT',
+  'FLOW_USAGE_UNKNOWN',
+  'FLOW_ACCESS_DENIED',
+  'FLOW_STORAGE_INVALID',
 ]);
 
 const STABLE_DOMAIN_CODES = new Set([
@@ -173,9 +177,12 @@ export class FlowExecutor {
     try {
       await this.runUntilPause(jobId, signal);
     } catch (error) {
+      const runtimeCode = stableFailureCode(error);
+      if (runtimeCode === 'FLOW_STORAGE_INVALID')
+        throw new ExecutionFailure(runtimeCode);
       const reason = abortReason(signal);
-      if (reason === 'RUNNER_STOPPED') return;
-      const code = reason === 'TIMEOUT' ? 'TIMEOUT' : stableFailureCode(error);
+      if (reason === 'RUNNER_STOPPED' || reason === 'JOB_CANCELLED') return;
+      const code = reason === 'TIMEOUT' ? 'TIMEOUT' : runtimeCode;
       this.failCurrent(jobId, code);
     }
   }
@@ -207,7 +214,13 @@ export class FlowExecutor {
         }
         return;
       }
-      if (context.status === 'COMPLETED' || context.status === 'FAILED') return;
+      if (
+        context.status === 'COMPLETED' ||
+        context.status === 'FAILED' ||
+        context.status === 'CANCELLING' ||
+        context.status === 'CANCELLED'
+      )
+        return;
       if (context.status !== 'RUNNING') return;
       const persistedJob = this.controllerStore.statusForJob(
         context.ownerId,
@@ -450,9 +463,12 @@ export class FlowExecutor {
       } catch (error) {
         clearTimeout(timeout);
         input.runnerSignal.removeEventListener('abort', externalAbort);
+        const code = stableFailureCode(error);
+        if (code === 'FLOW_STORAGE_INVALID') throw new ExecutionFailure(code);
         if (controller.signal.aborted) {
           const reason = abortReason(controller.signal);
-          if (reason === 'RUNNER_STOPPED') return null;
+          if (reason === 'RUNNER_STOPPED' || reason === 'JOB_CANCELLED')
+            return null;
           if (reason === 'TIMEOUT') {
             this.failCurrent(input.jobId, 'TIMEOUT');
             return null;
@@ -461,7 +477,6 @@ export class FlowExecutor {
             throw new ExecutionFailure('FLOW_NODE_TIMEOUT');
           throw new ExecutionFailure('FLOW_ABORTED');
         }
-        const code = stableFailureCode(error);
         if (code === 'FLOW_MODEL_REQUEST_FAILED' && retry < limits.maxRetries) {
           const currentContext = this.flowStore.getJobContext(input.jobId);
           if (
@@ -500,7 +515,8 @@ export class FlowExecutor {
       }
       if (controller.signal.aborted) {
         const reason = abortReason(controller.signal);
-        if (reason === 'RUNNER_STOPPED') return null;
+        if (reason === 'RUNNER_STOPPED' || reason === 'JOB_CANCELLED')
+          return null;
         if (reason === 'TIMEOUT') {
           this.failCurrent(input.jobId, 'TIMEOUT');
           return null;
@@ -1850,7 +1866,13 @@ export class FlowExecutor {
       return;
     }
     if (context === null) throw new ExecutionFailure('FLOW_STORAGE_INVALID');
-    if (context.status === 'COMPLETED' || context.status === 'FAILED') return;
+    if (
+      context.status === 'COMPLETED' ||
+      context.status === 'FAILED' ||
+      context.status === 'CANCELLING' ||
+      context.status === 'CANCELLED'
+    )
+      return;
     let result: FlowStepResult;
     try {
       result = this.flowStore.fail({

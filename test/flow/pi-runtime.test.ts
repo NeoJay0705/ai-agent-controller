@@ -76,7 +76,18 @@ type FakeMode =
   | 'invalid-jsonl-history'
   | 'oversized-history'
   | 'cross-session-link'
-  | 'cancel-history-leak';
+  | 'cancel-history-leak'
+  | 'usage-valid'
+  | 'usage-wrong-nonce'
+  | 'usage-without-request'
+  | 'usage-request-jump'
+  | 'usage-request-duplicate'
+  | 'usage-duplicate'
+  | 'usage-invalid-total'
+  | 'usage-missing-settled'
+  | 'usage-over-budget-request'
+  | 'usage-request-after-settled'
+  | 'usage-without-budget';
 
 interface FakeGuardConfig {
   readonly nonce: string;
@@ -84,6 +95,7 @@ interface FakeGuardConfig {
   readonly model: string;
   readonly thinking: string;
   readonly tools: readonly string[];
+  readonly tokenBudget?: number;
   readonly auth?: { readonly mode: 'pi-login'; readonly expiresAt: number };
 }
 
@@ -169,7 +181,7 @@ class FakeRpcChild extends EventEmitter {
   closed = false;
 
   private readonly mode: FakeMode;
-  private readonly guardConfig: FakeGuardConfig;
+  readonly guardConfig: FakeGuardConfig;
   private readonly sessionFile: string;
   private readonly sessionId: string;
   private readonly provider: string;
@@ -351,6 +363,7 @@ class FakeRpcChild extends EventEmitter {
         symlinkSync(this.foreignHistoryPath, this.sessionFile);
       }
       this.respond(request, { disposition: 'started' });
+      if (this.mode.startsWith('usage-')) this.sendUsageScenario();
       if (
         this.mode === 'hang' ||
         this.mode === 'cancel-history-leak' ||
@@ -463,6 +476,90 @@ class FakeRpcChild extends EventEmitter {
       this.sendEvent({ type: 'agent_settled', aborted: true });
     }
     this.respond(request, {});
+  }
+
+  private sendUsageScenario(): void {
+    const nonce =
+      this.mode === 'usage-wrong-nonce'
+        ? 'wrong-usage-nonce'
+        : this.guardConfig.nonce;
+    const event = (notification: Record<string, unknown>): void => {
+      this.sendEvent({
+        type: 'extension_ui_request',
+        id: randomUUID(),
+        method: 'notify',
+        notifyType: 'info',
+        message: JSON.stringify(notification),
+      });
+    };
+    const request = (sequence: number, requestNonce = nonce): void => {
+      event({ tag: 'flow-host-request', nonce: requestNonce, sequence });
+    };
+    const usage = (
+      sequence: number,
+      totalTokens: number,
+      usageNonce = nonce,
+    ): void => {
+      event({
+        tag: 'flow-host-usage',
+        nonce: usageNonce,
+        sequence,
+        totalTokens,
+      });
+    };
+    const settled = (complete = true): void => {
+      event({ tag: 'flow-host-usage-settled', nonce, complete });
+    };
+
+    switch (this.mode) {
+      case 'usage-valid':
+        request(1);
+        usage(1, 30);
+        settled();
+        break;
+      case 'usage-wrong-nonce':
+        request(1);
+        break;
+      case 'usage-without-request':
+        usage(1, 5);
+        break;
+      case 'usage-request-jump':
+        request(2);
+        break;
+      case 'usage-request-duplicate':
+        request(1);
+        request(1);
+        break;
+      case 'usage-duplicate':
+        request(1);
+        usage(1, 5);
+        usage(1, 5);
+        break;
+      case 'usage-invalid-total':
+        request(1);
+        usage(1, 0);
+        break;
+      case 'usage-missing-settled':
+        request(1);
+        usage(1, 5);
+        break;
+      case 'usage-over-budget-request':
+        request(1);
+        usage(1, 30);
+        request(2);
+        break;
+      case 'usage-request-after-settled':
+        request(1);
+        usage(1, 5);
+        settled();
+        request(2);
+        break;
+      case 'usage-without-budget':
+        usage(1, 5);
+        break;
+      default:
+        break;
+    }
   }
 
   private respond(request: FakeRequest, data: Record<string, unknown>): void {
@@ -1040,6 +1137,123 @@ describe('Pi CLI JSONL/RPC AgentRuntime', () => {
       } finally {
         await runtime.dispose();
       }
+    }
+  });
+
+  it('validates usage RPC notifications and releases the Session after every outcome', async () => {
+    const usageCases: Array<{
+      readonly mode: FakeMode;
+      readonly code: string;
+      readonly withBudget?: boolean;
+    }> = [
+      { mode: 'usage-wrong-nonce', code: 'FLOW_GUARD_HANDSHAKE_FAILED' },
+      { mode: 'usage-without-request', code: 'FLOW_GUARD_HANDSHAKE_FAILED' },
+      { mode: 'usage-request-jump', code: 'FLOW_GUARD_HANDSHAKE_FAILED' },
+      { mode: 'usage-request-duplicate', code: 'FLOW_GUARD_HANDSHAKE_FAILED' },
+      { mode: 'usage-duplicate', code: 'FLOW_GUARD_HANDSHAKE_FAILED' },
+      { mode: 'usage-invalid-total', code: 'FLOW_GUARD_HANDSHAKE_FAILED' },
+      { mode: 'usage-missing-settled', code: 'FLOW_USAGE_UNKNOWN' },
+      {
+        mode: 'usage-over-budget-request',
+        code: 'FLOW_GUARD_HANDSHAKE_FAILED',
+      },
+      {
+        mode: 'usage-request-after-settled',
+        code: 'FLOW_GUARD_HANDSHAKE_FAILED',
+      },
+      {
+        mode: 'usage-without-budget',
+        code: 'FLOW_GUARD_HANDSHAKE_FAILED',
+        withBudget: false,
+      },
+    ];
+    const cases = [
+      ...usageCases.map((item) => ({ ...item, kind: 'reject' as const })),
+      { mode: 'usage-valid' as const, code: '', kind: 'success' as const },
+      {
+        mode: 'usage-valid' as const,
+        code: 'FLOW_STORAGE_INVALID',
+        kind: 'callback' as const,
+      },
+    ];
+
+    for (const item of cases) {
+      const repository = new FakeIdentityRepository();
+      const children: FakeRpcChild[] = [];
+      const modes: FakeMode[] = [
+        item.kind === 'callback' ? 'usage-valid' : item.mode,
+        'success',
+      ];
+      const runtime = new PiCliRpcRuntime(
+        createRuntimeOptions(createTestDataRoot(), repository, {
+          spawnForTests: (_command, args, spawnOptions) => {
+            const child = new FakeRpcChild(
+              args,
+              modes.shift() ?? 'success',
+              childEnvironment(spawnOptions),
+            );
+            children.push(child);
+            return child as unknown as ChildProcessWithoutNullStreams;
+          },
+        }),
+      );
+      const requests: number[] = [];
+      const usages: Array<[number, number]> = [];
+      const settlements: boolean[] = [];
+      const input = createInput();
+      const withBudget = !('withBudget' in item) || item.withBudget;
+      const budget = {
+        limitTokens: 25,
+        onRequestStarted: (sequence: number): void => {
+          requests.push(sequence);
+        },
+        onUsage: (sequence: number, totalTokens: number): void => {
+          usages.push([sequence, totalTokens]);
+          if (item.kind === 'callback')
+            throw new Error('synthetic callback failure');
+        },
+        onSettled: (complete: boolean): void => {
+          settlements.push(complete);
+        },
+      };
+
+      try {
+        if (item.kind === 'success') {
+          await expect(
+            runtime.run({ ...input, usageBudget: budget }),
+          ).resolves.toEqual({
+            transition: 'ready',
+            result: { suggestedFlow: 'mbti' },
+          });
+          expect(requests).toEqual([1]);
+          expect(usages).toEqual([[1, 30]]);
+          expect(settlements).toEqual([true]);
+          expect(children[0]?.guardConfig.tokenBudget).toBe(25);
+          expect(children[0]?.closed).toBe(true);
+        } else {
+          const runInput = withBudget
+            ? { ...input, usageBudget: budget }
+            : input;
+          await expect(runtime.run(runInput)).rejects.toMatchObject({
+            code: item.code,
+          });
+          expect(children[0]?.closed).toBe(true);
+          if (item.kind === 'callback') {
+            expect(children[0]?.commands).toContain('clear_queue');
+            expect(children[0]?.commands).toContain('abort');
+            expect(requests).toEqual([1]);
+            expect(usages).toEqual([[1, 30]]);
+          }
+        }
+        await expect(runtime.run(createInput())).resolves.toEqual({
+          transition: 'ready',
+          result: { suggestedFlow: 'mbti' },
+        });
+        expect(children.at(-1)?.closed).toBe(true);
+      } finally {
+        await runtime.dispose();
+      }
+      await runtime.dispose();
     }
   });
 

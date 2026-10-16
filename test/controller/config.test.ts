@@ -1,11 +1,46 @@
 import { describe, expect, it } from 'vitest';
 
 import { parseControllerConfig } from '../../src/controller/config.js';
+import { parseTrialPolicy } from '../../src/controller/trial-policy.js';
 import { TEST_TOKEN, USER_ID } from './helpers.js';
 
 const FLOW_CONFIG_PATH = '/workspace/flows.json';
 
 describe('controller configuration', () => {
+  it('rejects trial policy numbers with trailing line separators', () => {
+    for (const suffix of [
+      String.fromCharCode(10),
+      String.fromCharCode(13),
+      String.fromCharCode(0x2028),
+      String.fromCharCode(0x2029),
+    ]) {
+      expect(() =>
+        parseTrialPolicy({ TRIAL_MAX_JOBS: `1${suffix}` }),
+      ).toThrow();
+    }
+  });
+  it('rejects guest running concurrency above one and preserves Owner global concurrency', () => {
+    expect(parseTrialPolicy({}).maxRunningJobs).toBe(1);
+    expect(() => parseTrialPolicy({ TRIAL_MAX_RUNNING_JOBS: '2' })).toThrow(
+      /TRIAL_MAX_RUNNING_JOBS/,
+    );
+    const config = parseControllerConfig(
+      {
+        TELEGRAM_BOT_TOKEN: TEST_TOKEN,
+        TELEGRAM_ALLOWED_USER_ID: USER_ID,
+        PI_FLOW_CONFIG: FLOW_CONFIG_PATH,
+        JOB_CONCURRENCY: '4',
+        TRIAL_MAX_RUNNING_JOBS: '1',
+      },
+      '/workspace',
+    );
+    expect(config).toMatchObject({
+      mode: 'bot',
+      concurrency: 4,
+      trial: { maxRunningJobs: 1 },
+    });
+  });
+
   it('supports health-only mode and applies documented defaults without reading Flow config', () => {
     const env = {
       get PI_FLOW_CONFIG(): string {

@@ -106,18 +106,21 @@ Pi 原生 system prompt 會保留。Runtime 依序附加 Controller 共用規則
 
 授權只檢查 Telegram update 的 `from.id` 與 private chat。程式不以 username、display name 或訊息內容授權。
 
-| 命令／輸入               | 行為                                                                               |
-| ------------------------ | ---------------------------------------------------------------------------------- |
-| `/start`、`/help`        | 顯示說明。                                                                         |
-| `/new <name>`            | 建立並選取 Session。名稱長度為 1..100 UTF-16 code units。                          |
-| `/sessions`              | 列出本人 Session。                                                                 |
-| `/use <session_id>`      | 切換目前私訊的 Session。                                                           |
-| `/queue <text>`          | 在選取的 Session 建立 Job。                                                        |
-| `/steer <job_id> <text>` | 對指定非 terminal Job 加入 steering；不建立 Job，也不依目前選取 Session 決定目標。 |
-| `/status [job_id]`       | 直接查持久狀態，不建立 Job，也不呼叫 Pi。                                          |
-| 一般文字                 | 有效且仍開啟的 Flow prompt reply 會補充該 Job；其他一般文字會建立新 Job。          |
+| 命令／輸入               | 行為                                                                                        |
+| ------------------------ | ------------------------------------------------------------------------------------------- |
+| `/start`、`/help`        | 顯示說明。                                                                                  |
+| `/new <name>`            | 建立並選取 Session。名稱長度為 1..100 UTF-16 code units。                                   |
+| `/sessions`              | 列出本人 Session。                                                                          |
+| `/use <session_id>`      | 切換目前私訊的 Session。                                                                    |
+| `/queue <text>`          | 在選取的 Session 建立 Job。                                                                 |
+| `/steer <job_id> <text>` | 對指定非 terminal Job 加入 steering；不建立 Job，也不依目前選取 Session 決定目標。          |
+| `/status [job_id]`       | 直接查持久狀態，不建立 Job，也不呼叫 Pi。                                                   |
+| `/cancel [job_id]`       | 取消指定 Job；不帶 ID 時列出可取消 Job 供選擇。                                             |
+| 一般文字                 | 無上下文時不建立 Job；`/queue` 引導後可輸入內容建立 Job；有效 Job prompt reply 補充原 Job。 |
 
 輸入必須是非空文字，最多 4096 UTF-16 code units。過期或 inactive prompt reply 不會重新開啟舊 Job。一般未引用／未回覆 prompt 的文字會新建 Job，不是既有 Job 的補充；請回覆正確的 Flow 訊息，或使用 `/steer <job_id> <text>`。
+
+Owner 另可使用 `/allow`、`/revoke`、`/guests` 與 `/invite` 管理試用權限；詳細行為見下方「Controlled multi-user trials」段落。
 
 ## 使用者手動驗收範例
 
@@ -215,3 +218,17 @@ npm exec vitest run test/controller/flow-live.test.ts
 測試只使用合成使用者、訊息、出生資料與獨立合成 SQLite／Pi Session history。產物寫入唯一 `.test-artifacts/pi-flow/live-model/<UUID>/` 目錄，資料夾權限為 `0700`，報告與 transcript 權限為 `0600`。不會重用或自動刪除舊 run。可用 `PI_FLOW_LIVE_ARTIFACT_ROOT` 指定此 repo 下 `.test-artifacts/pi-flow/live-model/` 之內的子目錄；其他路徑會在建立 Controller 或使用認證前拒絕。
 
 測試不連真 Telegram，也不驗收 Telegram。真模型語意不保證通過。Natal 計算只與本機 server 的 `calculateNatalChart` 重算結果比對，不是外部星曆 golden 驗證。MBTI 結果是非官方自我反思，不是心理診斷。完成 live 執行也不代表整個產品的外部服務或部署環境已驗收。
+
+## Controlled multi-user trials (implemented; offline verification)
+
+The controlled-trial feature is connected to the Router, Service, SQLite store, Runner, outbox, and Agent runtime. Offline verification uses synthetic tests. See the [requirements](docs/controlled-trial-requirements.md) and [design](docs/controlled-trial-design.md). Real Telegram, provider, OAuth, and deployment behavior remain unverified; offline verification is not external acceptance.
+
+The bot keeps `TELEGRAM_ALLOWED_USER_ID` as the owner. The owner can grant access with `/allow <user_id> [duration]`, revoke it with `/revoke <user_id>`, inspect users with `/guests`, and create one-use invite links with `/invite <invite TTL> [trial duration]`. Durations use a positive integer followed by `s`, `m`, `h`, or `d`; each duration is limited to 2147483647 milliseconds. The default trial is one hour and invite links expire after ten minutes.
+
+Guests use `/new`, `/sessions`, `/use`, `/queue <text>`, `/steer <job_id> <text>`, `/status [job_id]`, and `/cancel [job_id]`. Plain text does not create a Job. An invite is redeemed only with `/start <token>`. Revocation and expiry deny new work and cancel queued or active Jobs. Command menus are convenience only; authorization is checked for every update.
+
+Trial limits are configurable with the `TRIAL_*`, `INVITE_TTL_MS`, `COMMAND_DIALOG_TTL_MS`, and `CONTROL_MAX_PER_MINUTE` variables listed in `.env.example`. In v1, each guest user can run only one Job at a time because each guest user has one pending usage operation. `TRIAL_MAX_RUNNING_JOBS` accepts only `1`; it does not silently clamp larger values. The Owner is not limited by this guest trial concurrency setting. Global worker capacity remains controlled by `JOB_CONCURRENCY`.
+
+Token usage uses native provider usage. A Session token limit rejects new model requests for that Session. A user token limit, or unknown usage, rejects new model requests for that guest user across Sessions. Status, cancel, and help control commands remain available. Other guest work is not blocked by these token-limit conditions. The final provider request can exceed the remaining allowance before its usage is known. Cancellation can also leave usage unknown. Guests use the Owner's authenticated provider quota; they do not need to log in to Pi.
+
+Run `npm run check` for offline checks. Synthetic tests do not verify a real Telegram Bot API, provider, OAuth flow, or deployment.

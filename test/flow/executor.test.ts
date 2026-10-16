@@ -618,6 +618,97 @@ describe('FlowExecutor host-controlled execution', () => {
     },
   );
 
+  it('propagates FLOW_STORAGE_INVALID instead of writing a false failed notification', async () => {
+    const controller = memoryController(() => NOW);
+    try {
+      const { jobId } = queueJob(controller, 'usage persistence failure');
+      const flowStore = testFlowStore(controller, () => NOW);
+      const fake = new FakeAgentRuntime({
+        responder: () => {
+          throw new PiCliRpcRuntimeError('FLOW_STORAGE_INVALID');
+        },
+      });
+      const executor = new FlowExecutor(controller, flowStore, fake, {
+        now: () => NOW,
+      });
+      await expect(startJob(flowStore, executor, jobId)).rejects.toMatchObject({
+        code: 'FLOW_STORAGE_INVALID',
+      });
+      expect(controller.statusForJob(FLOW_USER_ID, jobId)?.status).toBe(
+        'RUNNING',
+      );
+      expect(
+        controller
+          .dueOutbox(NOW)
+          .filter((item) => item.jobId === jobId && item.kind === 'failed'),
+      ).toHaveLength(0);
+    } finally {
+      controller.close();
+    }
+  });
+
+  it.each(['JOB_CANCELLED', 'RUNNER_STOPPED', 'TIMEOUT'] as const)(
+    'propagates FLOW_STORAGE_INVALID after %s abort only when the runtime settles',
+    async (reason) => {
+      const controller = memoryController(() => NOW);
+      let rejectRuntime: ((error: Error) => void) | undefined;
+      let runtimeStarted: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        runtimeStarted = resolve;
+      });
+      const deferred = new Promise<never>((_resolve, reject) => {
+        rejectRuntime = reject;
+      });
+      try {
+        const { jobId } = queueJob(controller, 'deferred storage failure');
+        const flowStore = testFlowStore(controller, () => NOW);
+        const fake = new FakeAgentRuntime({
+          responder: () => {
+            runtimeStarted?.();
+            return deferred;
+          },
+        });
+        const executor = new FlowExecutor(controller, flowStore, fake, {
+          now: () => NOW,
+        });
+        expect(
+          flowStore.reserveReadyJobs(NOW, 1).map((item) => item.jobId),
+        ).toContain(jobId);
+        const abort = new AbortController();
+        const running = executor.execute(jobId, abort.signal);
+        let settled = false;
+        void running.then(
+          () => {
+            settled = true;
+          },
+          () => {
+            settled = true;
+          },
+        );
+        await started;
+        abort.abort(reason);
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        const storageError = new PiCliRpcRuntimeError('FLOW_STORAGE_INVALID');
+        rejectRuntime?.(storageError);
+        await expect(running).rejects.toMatchObject({
+          code: 'FLOW_STORAGE_INVALID',
+        });
+        expect(controller.statusForJob(FLOW_USER_ID, jobId)?.status).toBe(
+          'RUNNING',
+        );
+        expect(
+          controller
+            .dueOutbox(NOW)
+            .filter((item) => item.jobId === jobId && item.kind === 'failed'),
+        ).toHaveLength(0);
+      } finally {
+        controller.close();
+      }
+    },
+  );
+
   it('retries only an explicit failed model request and never retries an ambiguous child exit', async () => {
     for (const scenario of [
       {

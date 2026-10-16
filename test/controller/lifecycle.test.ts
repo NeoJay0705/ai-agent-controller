@@ -46,6 +46,14 @@ function createLegacyV1Database(path: string, offset: string): void {
   const database = new DatabaseSync(path);
   try {
     database.exec(`
+      DROP TABLE trial_usage_events;
+      DROP TABLE trial_usage_operations;
+      DROP TABLE command_menu_sync;
+      DROP TABLE command_dialogs;
+      DROP TABLE trial_invites;
+      DROP TABLE trial_events;
+      DROP TABLE trial_users;
+      ALTER TABLE outbox DROP COLUMN delivery_class;
       DROP TABLE outbox_cancellations;
       DROP TABLE pi_sessions;
       DROP TABLE session_facts;
@@ -122,7 +130,7 @@ describe('controller resources and service lifecycle', () => {
       ).toEqual({ value: '11' });
       expect(
         resources.store.database.prepare('PRAGMA user_version').get(),
-      ).toMatchObject({ user_version: 2 });
+      ).toMatchObject({ user_version: 3 });
       await resources.close();
       await expect(
         stat(join(dataDir, 'controller.lock')),

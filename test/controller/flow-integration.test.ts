@@ -112,6 +112,19 @@ class SimulatedTelegram {
           : input.url;
     const method = new URL(url).pathname.split('/').at(-1) ?? '';
     this.calls.push(method);
+    if (method === 'getMe')
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ ok: true, result: { username: 'synthetic_bot' } }),
+          { status: 200 },
+        ),
+      );
+    if (method === 'setMyCommands')
+      return Promise.resolve(
+        new Response(JSON.stringify({ ok: true, result: true }), {
+          status: 200,
+        }),
+      );
     if (method === 'getUpdates') {
       return Promise.resolve(
         new Response(

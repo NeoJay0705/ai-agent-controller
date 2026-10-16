@@ -250,6 +250,15 @@ describe('HTTP server and controller wiring', () => {
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
       methods.push(method);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      methods.push(method);
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') return updateResponse(updates.splice(0));
       if (method !== 'sendMessage')
         throw new Error(`Unexpected Telegram API method ${method}.`);
@@ -312,7 +321,9 @@ describe('HTTP server and controller wiring', () => {
       );
       expect(methods).toContain('getUpdates');
       expect(methods).toContain('sendMessage');
-      expect(new Set(methods)).toEqual(new Set(['getUpdates', 'sendMessage']));
+      expect(new Set(methods)).toEqual(
+        new Set(['getUpdates', 'sendMessage', 'getMe', 'setMyCommands']),
+      );
       expect(methods).not.toContain('deleteWebhook');
       expect(
         bodies.some(
@@ -513,6 +524,15 @@ describe('HTTP server and controller wiring', () => {
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
       methods.push(method);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      methods.push(method);
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method === 'getUpdates') return updateResponse(updates.splice(0));
       if (method !== 'sendMessage')
         throw new Error(`Unexpected fake Telegram method ${method}.`);
@@ -623,6 +643,15 @@ describe('HTTP server and controller wiring', () => {
     const fetcher: FetchLike = (input) => {
       const method = methodName(input);
       methods.push(method);
+      if (method === 'getMe')
+        return jsonResponse({
+          id: 123456,
+          is_bot: true,
+          first_name: 'Synthetic',
+          username: 'synthetic_bot',
+        });
+      methods.push(method);
+      if (method === 'setMyCommands') return jsonResponse(true);
       if (method !== 'getUpdates')
         throw new Error('Only getUpdates is expected before fatal shutdown.');
       return Promise.resolve(new Response('not-json', { status: 401 }));

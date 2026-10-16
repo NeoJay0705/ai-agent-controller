@@ -30,6 +30,7 @@ import type {
   AgentNodeResult,
   AgentRuntime,
   FlowLimits,
+  UsageBudget,
   FlowRuntime,
   NodeDefinition,
 } from './types.js';
@@ -114,6 +115,9 @@ export type PiCliRpcRuntimeErrorCode =
   | 'FLOW_RPC_CHILD_EXITED'
   | 'FLOW_RPC_PROTOCOL_FAILED'
   | 'FLOW_MODEL_REQUEST_FAILED'
+  | 'FLOW_TOKEN_LIMIT'
+  | 'FLOW_USAGE_UNKNOWN'
+  | 'FLOW_STORAGE_INVALID'
   | 'FLOW_RESULT_INVALID'
   | 'FLOW_RUNTIME_DISPOSED';
 
@@ -180,6 +184,7 @@ interface GuardConfig {
   readonly thinking: string;
   readonly tools: readonly string[];
   readonly effectiveLimits: FlowLimits;
+  readonly tokenBudget?: number;
   readonly auth?: {
     readonly mode: 'pi-login';
     readonly expiresAt: number;
@@ -365,6 +370,7 @@ export class PiCliRpcRuntime implements AgentRuntime {
         tools,
         nonce,
         authMetadata,
+        input.usageBudget?.limitTokens,
       );
       const nodeSystemPrompt = createNodeSystemPrompt(
         input.node,
@@ -498,6 +504,7 @@ export class PiCliRpcRuntime implements AgentRuntime {
         tools,
         config,
         operation,
+        input.usageBudget,
       );
       operation.unsubscribeEvents = tracker.unsubscribe;
       const disposition = await raceFailure(client.prompt(prompt), operation);
@@ -766,6 +773,7 @@ function createGuardConfig(
   tools: readonly string[],
   nonce: string,
   auth?: GuardConfig['auth'],
+  tokenBudget?: number,
 ): GuardConfig {
   return {
     version: 1,
@@ -775,6 +783,7 @@ function createGuardConfig(
     thinking: runtime.thinking,
     tools: [...tools],
     effectiveLimits: limits,
+    ...(tokenBudget === undefined ? {} : { tokenBudget }),
     ...(auth === undefined ? {} : { auth }),
     node: {
       id: node.id,
@@ -1835,6 +1844,7 @@ function createRunTracker(
   allowedTools: readonly string[],
   guardConfig: GuardConfig,
   operation: ActiveOperation,
+  usageBudget?: UsageBudget,
 ): {
   readonly completion: Promise<RunCompletion>;
   readonly unsubscribe: () => void;
@@ -1857,6 +1867,12 @@ function createRunTracker(
   let toolCalls = 0;
   let outputChars = 0;
   let active = true;
+  let hostUsageSettled = usageBudget === undefined;
+  let requestSequence = 0;
+  let requestOutstanding = false;
+  let hostUsageComplete = false;
+  let hostUsageKnown = true;
+  let hostSpent = 0;
 
   const reject = (code: PiCliRpcRuntimeErrorCode): void => {
     if (operation.failureCode === undefined) failOperation(operation, code);
@@ -1915,7 +1931,7 @@ function createRunTracker(
       return;
     }
     if (event.type === 'extension_ui_request') {
-      if (event['notifyType'] !== 'error') {
+      if (event['notifyType'] !== 'error' && event['notifyType'] !== 'info') {
         reject('FLOW_GUARD_HANDSHAKE_FAILED');
         return;
       }
@@ -1930,8 +1946,107 @@ function createRunTracker(
         reject('FLOW_GUARD_HANDSHAKE_FAILED');
         return;
       }
+      if (!isRecord(notification)) {
+        reject('FLOW_GUARD_HANDSHAKE_FAILED');
+        return;
+      }
       if (
-        !isRecord(notification) ||
+        (event['notifyType'] === 'info' &&
+          notification['tag'] !== 'flow-host-request' &&
+          notification['tag'] !== 'flow-host-usage' &&
+          notification['tag'] !== 'flow-host-usage-settled') ||
+        (event['notifyType'] === 'error' &&
+          notification['tag'] !== 'flow-host-failure')
+      ) {
+        reject('FLOW_GUARD_HANDSHAKE_FAILED');
+        return;
+      }
+      if (
+        notification['tag'] === 'flow-host-request' ||
+        notification['tag'] === 'flow-host-usage' ||
+        notification['tag'] === 'flow-host-usage-settled'
+      ) {
+        const tag = notification['tag'];
+        if (notification['nonce'] !== guardConfig.nonce) {
+          reject('FLOW_GUARD_HANDSHAKE_FAILED');
+          return;
+        }
+        if (
+          tag === 'flow-host-request' &&
+          hasExactKeys(notification, ['tag', 'nonce', 'sequence']) &&
+          Number.isSafeInteger(notification['sequence']) &&
+          notification['sequence'] === requestSequence + 1 &&
+          !requestOutstanding &&
+          !hostUsageSettled &&
+          hostUsageKnown &&
+          usageBudget !== undefined &&
+          hostSpent < usageBudget.limitTokens
+        ) {
+          requestSequence += 1;
+          requestOutstanding = true;
+          try {
+            usageBudget.onRequestStarted(requestSequence);
+          } catch {
+            reject('FLOW_STORAGE_INVALID');
+          }
+          return;
+        }
+        if (
+          tag === 'flow-host-usage' &&
+          hasExactKeys(notification, [
+            'tag',
+            'nonce',
+            'sequence',
+            'totalTokens',
+          ]) &&
+          Number.isSafeInteger(notification['sequence']) &&
+          notification['sequence'] === requestSequence &&
+          requestOutstanding &&
+          !hostUsageSettled &&
+          Number.isSafeInteger(notification['totalTokens']) &&
+          (notification['totalTokens'] as number) > 0
+        ) {
+          const total = notification['totalTokens'] as number;
+          if (!Number.isSafeInteger(hostSpent + total)) {
+            hostUsageKnown = false;
+            reject('FLOW_USAGE_UNKNOWN');
+            return;
+          }
+          hostSpent += total;
+          requestOutstanding = false;
+          try {
+            usageBudget?.onUsage(requestSequence, total);
+          } catch {
+            reject('FLOW_STORAGE_INVALID');
+          }
+          return;
+        }
+        if (
+          tag === 'flow-host-usage-settled' &&
+          hasExactKeys(notification, ['tag', 'nonce', 'complete']) &&
+          typeof notification['complete'] === 'boolean' &&
+          !hostUsageSettled &&
+          usageBudget !== undefined
+        ) {
+          hostUsageSettled = true;
+          hostUsageComplete =
+            notification['complete'] &&
+            requestSequence > 0 &&
+            !requestOutstanding &&
+            hostUsageKnown;
+          try {
+            usageBudget.onSettled(hostUsageComplete);
+          } catch {
+            reject('FLOW_STORAGE_INVALID');
+            return;
+          }
+          if (!hostUsageComplete) reject('FLOW_USAGE_UNKNOWN');
+          return;
+        }
+        reject('FLOW_GUARD_HANDSHAKE_FAILED');
+        return;
+      }
+      if (
         !hasExactKeys(notification, ['tag', 'nonce', 'code']) ||
         notification['tag'] !== 'flow-host-failure' ||
         notification['nonce'] !== guardConfig.nonce ||
@@ -2046,6 +2161,11 @@ function createRunTracker(
         reject('FLOW_MODEL_REQUEST_FAILED');
       } else if (event['aborted']) {
         reject('FLOW_ABORTED');
+      } else if (
+        !hostUsageSettled ||
+        (usageBudget !== undefined && !hostUsageComplete)
+      ) {
+        reject('FLOW_USAGE_UNKNOWN');
       } else {
         settled = true;
         resolveCompletion({
@@ -2263,6 +2383,12 @@ function mapGuardFailureCode(value: string): PiCliRpcRuntimeErrorCode {
       return 'FLOW_PROMPT_INVALID';
     case 'FLOW_MODEL_REQUEST_FAILED':
       return 'FLOW_MODEL_REQUEST_FAILED';
+    case 'FLOW_TOKEN_LIMIT':
+      return 'FLOW_TOKEN_LIMIT';
+    case 'FLOW_USAGE_UNKNOWN':
+      return 'FLOW_USAGE_UNKNOWN';
+    case 'FLOW_STORAGE_INVALID':
+      return 'FLOW_STORAGE_INVALID';
     case 'FLOW_AUTH_SNAPSHOT_INVALID':
       return 'FLOW_AUTH_SNAPSHOT_INVALID';
     default:

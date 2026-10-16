@@ -5,6 +5,14 @@ import { FlowRegistry } from '../flow/registry.js';
 import { FlowRunner } from '../flow/runner.js';
 import { FlowStore } from '../flow/store.js';
 import { PiCliRpcRuntime } from '../flow/pi-rpc-runtime.js';
+import { TrialBudgetRuntime } from '../flow/trial-runtime.js';
+import { TrialStore } from './trial-store.js';
+import { DEFAULT_TRIAL_POLICY } from './trial-policy.js';
+import {
+  DEFAULT_BOT_COMMANDS,
+  GUEST_BOT_COMMANDS,
+  OWNER_BOT_COMMANDS,
+} from './commands.js';
 import type { ControllerConfig, ServiceLogger } from './types.js';
 import { TelegramRouter } from './router.js';
 import { TelegramClient, TelegramError } from './telegram.js';
@@ -46,6 +54,8 @@ export class ControllerService {
   private readonly outboxIntervalMs: number;
   private readonly flowStore: FlowStore;
   private readonly allowedUserId: string;
+  private readonly trialStore: TrialStore;
+  private readonly botUsername = { value: null as string | null };
   private readonly abortController = new AbortController();
   private loops: Promise<void>[] = [];
   private startupTask: Promise<void> | null = null;
@@ -69,6 +79,12 @@ export class ControllerService {
     this.resources = resources;
     this.telegram = telegram;
     this.now = () => options.clock?.now() ?? Date.now();
+    this.trialStore = new TrialStore(
+      resources.store,
+      config.allowedUserId,
+      config.trial ?? DEFAULT_TRIAL_POLICY,
+      { now: this.now },
+    );
     this.sleep = options.sleep ?? abortableSleep;
     this.logger = options.logger ?? consoleLogger;
     this.onFatal = options.onFatal ?? (() => undefined);
@@ -91,15 +107,26 @@ export class ControllerService {
           ? {}
           : { environment: options.environment }),
       });
+    const budgetedRuntime = new TrialBudgetRuntime(
+      agentRuntime,
+      resources.store,
+      this.trialStore,
+    );
     const executor = new FlowExecutor(
       resources.store,
       this.flowStore,
-      agentRuntime,
+      budgetedRuntime,
       { now: this.now },
     );
     this.runner = new FlowRunner(resources.store, this.flowStore, executor, {
       concurrency: config.concurrency,
       now: this.now,
+      canRunOwner: (ownerId) =>
+        this.trialStore.access(ownerId).role !== 'denied',
+      maxWorkersPerOwner: (ownerId) =>
+        ownerId === config.allowedUserId
+          ? config.concurrency
+          : (config.trial ?? DEFAULT_TRIAL_POLICY).maxRunningJobs,
       onError: (error) => {
         const code = safeClassification(error);
         if (ORCHESTRATION_FAILURES.has(code)) {
@@ -115,6 +142,9 @@ export class ControllerService {
         this.logger.warn(`update skipped: ${classification}`);
       },
       flowStore: this.flowStore,
+      trialStore: this.trialStore,
+      now: this.now,
+      botUsername: () => this.botUsername.value,
     });
   }
 
@@ -122,6 +152,13 @@ export class ControllerService {
     if (this.started || this.stopping !== null) {
       throw new Error('Controller service has already started.');
     }
+    this.resources.store.transaction(() => {
+      this.trialStore.clearAllDialogs();
+      this.trialStore.recoverPendingUsage();
+      this.trialStore.expireTrials();
+      this.trialStore.queueMenu(this.allowedUserId, 'owner');
+      this.trialStore.queueExistingGuestMenus();
+    });
     this.flowStore.restartTerminateAll();
     this.readyAtSec = Math.floor(this.now() / 1000) + 1;
     this.started = true;
@@ -150,15 +187,19 @@ export class ControllerService {
     if (signalIsAborted(signal)) return;
 
     this.resources.store.transaction(() => {
-      this.resources.store.reply(this.allowedUserId, READY_NOTICE);
+      this.resources.store.replyControl(this.allowedUserId, READY_NOTICE);
     });
     if (signalIsAborted(signal)) return;
-    this.loops = [this.pollLoop(), this.runnerLoop(), this.outboxLoop()].map(
-      (loop) =>
-        loop.catch(() => {
-          if (!signalIsAborted(signal))
-            this.failController('FLOW_STORAGE_INVALID');
-        }),
+    this.loops = [
+      this.pollLoop(),
+      this.runnerLoop(),
+      this.outboxLoop(),
+      this.menuLoop(),
+    ].map((loop) =>
+      loop.catch(() => {
+        if (!signalIsAborted(signal))
+          this.failController('FLOW_STORAGE_INVALID');
+      }),
     );
   }
 
@@ -213,6 +254,7 @@ export class ControllerService {
     const signal = this.abortController.signal;
     while (!signal.aborted) {
       try {
+        this.resources.store.transaction(() => this.trialStore.expireTrials());
         this.runner.tick();
         attempts = 0;
         await this.sleep(100, signal);
@@ -245,6 +287,51 @@ export class ControllerService {
         for (const item of due) {
           if (signalIsAborted(signal)) return;
           if (!this.resources.store.isOutboxSendable(item.id)) continue;
+          const stillAuthorized = this.resources.store.transaction(() => {
+            if (item.deliveryClass === 'control') return true;
+            const row = this.resources.store.database
+              .prepare(
+                `SELECT COALESCE(j.owner_id,s.owner_id) AS owner_id, o.chat_id FROM outbox o LEFT JOIN jobs j ON j.id=o.job_id LEFT JOIN sessions s ON s.id=o.session_id WHERE o.id=?`,
+              )
+              .get(item.id) as
+              { owner_id?: unknown; chat_id?: unknown } | undefined;
+            let authorized = false;
+            if (typeof row?.owner_id === 'string') {
+              authorized =
+                this.trialStore.access(row.owner_id).role !== 'denied';
+            } else if (typeof row?.chat_id === 'string') {
+              const ownerChat = this.resources.store.database
+                .prepare(
+                  'SELECT 1 AS allowed FROM bindings WHERE user_id=? AND chat_id=? LIMIT 1',
+                )
+                .get(this.allowedUserId, row.chat_id) as
+                { allowed?: number } | undefined;
+              if (
+                row.chat_id === this.allowedUserId ||
+                ownerChat !== undefined
+              ) {
+                authorized = true;
+              }
+            }
+            if (
+              typeof row?.owner_id !== 'string' &&
+              !authorized &&
+              typeof row?.chat_id === 'string'
+            ) {
+              const guest = this.resources.store.database
+                .prepare(
+                  'SELECT user_id FROM trial_users WHERE chat_id=? AND revoked_at IS NULL AND expires_at>? LIMIT 1',
+                )
+                .get(row.chat_id, this.now()) as
+                { user_id?: unknown } | undefined;
+              authorized =
+                typeof guest?.user_id === 'string' &&
+                this.trialStore.access(guest.user_id).role === 'guest';
+            }
+            if (!authorized) this.resources.store.failOutbox(item.id);
+            return authorized;
+          });
+          if (!stillAuthorized) continue;
           sendableItems += 1;
           try {
             const sent = await this.telegram.sendMessage(
@@ -288,6 +375,87 @@ export class ControllerService {
         if (signalIsAborted(signal)) return;
         this.failController('FLOW_STORAGE_INVALID');
         return;
+      }
+    }
+  }
+
+  private async menuLoop(): Promise<void> {
+    const signal = this.abortController.signal;
+    let bootstrapAttempts = 0;
+    let defaultRegistered = false;
+    while (!signal.aborted) {
+      try {
+        if (this.botUsername.value === null) {
+          this.botUsername.value = await this.telegram.getMe(signal);
+          bootstrapAttempts = 0;
+        }
+        if (!defaultRegistered) {
+          await this.telegram.setMyCommands(
+            DEFAULT_BOT_COMMANDS,
+            undefined,
+            signal,
+          );
+          defaultRegistered = true;
+          bootstrapAttempts = 0;
+        }
+        const due = this.trialStore.dueMenus(this.now());
+        if (due.length === 0) {
+          await this.sleep(this.outboxIntervalMs, signal);
+          continue;
+        }
+        for (const row of due) {
+          if (signalIsAborted(signal)) return;
+          try {
+            const commands =
+              row.role === 'owner'
+                ? OWNER_BOT_COMMANDS
+                : row.role === 'guest'
+                  ? GUEST_BOT_COMMANDS
+                  : DEFAULT_BOT_COMMANDS;
+            await this.telegram.setMyCommands(commands, row.chatId, signal);
+            try {
+              this.resources.store.transaction(() =>
+                this.trialStore.completeMenu(row.chatId, row.generation),
+              );
+            } catch {
+              this.failController('FLOW_STORAGE_INVALID');
+              return;
+            }
+          } catch (error) {
+            if (signalIsAborted(signal) || isAborted(error)) return;
+            if (isFatalTelegram(error)) {
+              this.failController(error.kind);
+              return;
+            }
+            const delay = retryDelay(row.attempts, error);
+            try {
+              this.resources.store.transaction(() =>
+                this.trialStore.retryMenu(
+                  row.chatId,
+                  row.generation,
+                  this.now() + delay,
+                ),
+              );
+            } catch {
+              this.failController('FLOW_STORAGE_INVALID');
+              return;
+            }
+            if (row.role === 'default') defaultRegistered = false;
+          }
+        }
+      } catch (error) {
+        if (signalIsAborted(signal) || isAborted(error)) return;
+        if (isFatalTelegram(error)) {
+          this.failController(error.kind);
+          return;
+        }
+        if (!(error instanceof TelegramError)) {
+          this.failController('FLOW_STORAGE_INVALID');
+          return;
+        }
+        this.logger.warn(`menu retry: ${classification(error)}`);
+        await this.backoff(bootstrapAttempts, error, signal);
+        bootstrapAttempts += 1;
       }
     }
   }

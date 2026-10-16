@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { chmod } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 
+import { TRIAL_SCHEMA_DDL, V3_REQUIRED_COLUMNS } from './trial-schema.js';
 import type {
   JobRecord,
   JobStatus,
@@ -11,8 +12,8 @@ import type {
   SessionRecord,
 } from './types.js';
 
-const SCHEMA_VERSION = 2;
-const PREVIOUS_SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 3;
+const PREVIOUS_SCHEMA_VERSION = 2;
 const MAX_OUTBOX_UNITS = 3500;
 const V1_REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   meta: ['key', 'value'],
@@ -99,7 +100,12 @@ const V2_ADDITIONAL_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   outbox_cancellations: ['outbox_id', 'reason', 'created_at'],
 };
 const activeJobStatuses = ['RUNNING', 'WAITING_INPUT'] as const;
-const terminalStatuses = ['COMPLETED', 'FAILED'] as const;
+const terminalStatuses = ['COMPLETED', 'FAILED', 'CANCELLED'] as const;
+const cancellationReasons = [
+  'USER_CANCELLED',
+  'ACCESS_REVOKED',
+  'TRIAL_EXPIRED',
+] as const;
 
 export class DomainError extends Error {
   readonly code: string;
@@ -213,6 +219,40 @@ export class ControllerStore {
 
   reply(chatId: string, body: string, sessionId: string | null = null): void {
     this.enqueue(sessionId, null, 'reply', body, undefined, chatId);
+  }
+
+  replyControl(
+    chatId: string,
+    body: string,
+    sessionId: string | null = null,
+  ): void {
+    this.enqueue(
+      sessionId,
+      null,
+      'reply',
+      body,
+      undefined,
+      chatId,
+      null,
+      'control',
+    );
+  }
+
+  enqueueJobControlNotification(jobId: string, body: string): void {
+    const row = this.database
+      .prepare('SELECT session_id FROM jobs WHERE id=?')
+      .get(jobId) as { session_id?: unknown } | undefined;
+    if (row === undefined) throw new DomainError('NOT_FOUND', 'Job not found.');
+    this.enqueue(
+      asString(row.session_id, 'session id'),
+      jobId,
+      'reply',
+      body,
+      undefined,
+      undefined,
+      null,
+      'control',
+    );
   }
 
   /** Synchronous primitive for FlowStore transactions. Does not start a transaction. */
@@ -342,7 +382,7 @@ export class ControllerStore {
     }
     const pending = this.database
       .prepare(
-        "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('QUEUED', 'RUNNING', 'WAITING_INPUT')",
+        "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('QUEUED', 'RUNNING', 'WAITING_INPUT', 'CANCELLING')",
       )
       .get() as { count: unknown };
     if (asInteger(pending.count, 'pending jobs') >= maxPendingJobs) {
@@ -380,6 +420,111 @@ export class ControllerStore {
     return jobId;
   }
 
+  requestCancellation(
+    requesterId: string,
+    jobId: string,
+    ownerAdminId: string,
+    reason: string = 'USER_CANCELLED',
+  ): JobStatus {
+    const row = this.database
+      .prepare('SELECT id, owner_id, status FROM jobs WHERE id=?')
+      .get(jobId) as
+      { id?: unknown; owner_id?: unknown; status?: unknown } | undefined;
+    if (
+      row === undefined ||
+      (row.owner_id !== requesterId && requesterId !== ownerAdminId)
+    )
+      throw new DomainError('NOT_FOUND', 'Job not found.');
+    if (
+      !cancellationReasons.includes(
+        reason as (typeof cancellationReasons)[number],
+      )
+    )
+      throw new DomainError(
+        'CANCELLATION_REASON_INVALID',
+        'Cancellation reason is invalid.',
+      );
+    const status = asString(row.status, 'job status') as JobStatus;
+    if (
+      terminalStatuses.includes(status as (typeof terminalStatuses)[number]) ||
+      status === 'CANCELLING'
+    )
+      return status;
+    const next = status === 'RUNNING' ? 'CANCELLING' : 'CANCELLED';
+    const now = this.now();
+    this.database
+      .prepare(
+        'UPDATE jobs SET status=?, failure_code=?, updated_at=? WHERE id=?',
+      )
+      .run(next, reason, now, jobId);
+    this.database
+      .prepare(
+        "UPDATE messages SET steering_state='not_applied' WHERE job_id=? AND kind='steering' AND steering_state='pending'",
+      )
+      .run(jobId);
+    this.database
+      .prepare(
+        'UPDATE flow_runs SET revision=revision+1, wait_deadline=NULL WHERE job_id=?',
+      )
+      .run(jobId);
+    this.deactivatePrompts(jobId, 'JOB_TERMINAL');
+    const pending = this.database
+      .prepare("SELECT id FROM outbox WHERE job_id=? AND status='PENDING'")
+      .all(jobId) as { id: unknown }[];
+    const cancel = this.database.prepare(
+      'INSERT INTO outbox_cancellations(outbox_id, reason, created_at) VALUES (?, ?, ?) ON CONFLICT(outbox_id) DO NOTHING',
+    );
+    for (const item of pending)
+      cancel.run(asString(item.id, 'outbox id'), reason, now);
+    this.enqueueJobControlNotification(
+      jobId,
+      next === 'CANCELLED'
+        ? `Job cancelled (${reason}).`
+        : 'Cancellation requested; waiting for execution to stop.',
+    );
+    return next;
+  }
+
+  finishCancellation(jobId: string): JobStatus {
+    const row = this.database
+      .prepare('SELECT status, failure_code FROM jobs WHERE id=?')
+      .get(jobId) as { status?: unknown; failure_code?: unknown } | undefined;
+    if (row === undefined) throw new DomainError('NOT_FOUND', 'Job not found.');
+    const status = asString(row.status, 'job status') as JobStatus;
+    if (status !== 'CANCELLING') return status;
+    this.database
+      .prepare(
+        "UPDATE jobs SET status='CANCELLED', updated_at=? WHERE id=? AND status='CANCELLING'",
+      )
+      .run(this.now(), jobId);
+    const reason =
+      typeof row.failure_code === 'string'
+        ? row.failure_code
+        : 'USER_CANCELLED';
+    this.enqueueJobControlNotification(jobId, `Job cancelled (${reason}).`);
+    return 'CANCELLED';
+  }
+
+  cancelOwnerJobs(
+    userId: string,
+    ownerAdminId: string,
+    reason: string,
+  ): number {
+    const jobs = this.database
+      .prepare(
+        "SELECT id FROM jobs WHERE owner_id=? AND status IN ('QUEUED','RUNNING','WAITING_INPUT') ORDER BY created_at, sequence",
+      )
+      .all(userId) as { id: unknown }[];
+    for (const item of jobs)
+      this.requestCancellation(
+        ownerAdminId,
+        asString(item.id, 'job id'),
+        ownerAdminId,
+        reason,
+      );
+    return jobs.length;
+  }
+
   steerJob(
     ownerId: string,
     jobId: string,
@@ -390,7 +535,10 @@ export class ControllerStore {
     const job = this.getJobForOwner(ownerId, jobId);
     if (job === null) throw new DomainError('NOT_FOUND', 'Job not found.');
     if (
-      terminalStatuses.includes(job.status as (typeof terminalStatuses)[number])
+      terminalStatuses.includes(
+        job.status as (typeof terminalStatuses)[number],
+      ) ||
+      job.status === 'CANCELLING'
     ) {
       throw new DomainError('TERMINAL', 'That job has already finished.');
     }
@@ -673,7 +821,7 @@ export class ControllerStore {
     const rows = this.database
       .prepare(
         `SELECT o.id, o.session_id, o.job_id, o.kind, o.text, o.attempts, o.chat_id,
-                o.prompt_generation
+                o.prompt_generation, o.delivery_class
          FROM outbox o
          LEFT JOIN jobs j ON j.id=o.job_id
          LEFT JOIN flow_runs r ON r.job_id=o.job_id
@@ -711,6 +859,10 @@ export class ControllerStore {
         row['prompt_generation'] === null
           ? null
           : asInteger(row['prompt_generation'], 'outbox prompt generation'),
+      deliveryClass: asString(
+        row['delivery_class'],
+        'outbox delivery class',
+      ) as 'business' | 'control',
     }));
   }
 
@@ -825,6 +977,7 @@ export class ControllerStore {
     const version = asInteger(versionRow.user_version, 'schema version');
     if (
       version !== 0 &&
+      version !== 1 &&
       version !== PREVIOUS_SCHEMA_VERSION &&
       version !== SCHEMA_VERSION
     ) {
@@ -849,10 +1002,18 @@ export class ControllerStore {
   }
 
   private validateVersionedSchema(version: number): void {
-    const requiredColumns: Record<string, readonly string[]> = {
-      ...V1_REQUIRED_COLUMNS,
-      ...(version === SCHEMA_VERSION ? V2_ADDITIONAL_COLUMNS : {}),
-    };
+    const requiredColumns: Record<string, readonly string[]> = {};
+    for (const source of [
+      V1_REQUIRED_COLUMNS,
+      ...(version >= 2 ? [V2_ADDITIONAL_COLUMNS] : []),
+      ...(version >= 3 ? [V3_REQUIRED_COLUMNS] : []),
+    ]) {
+      for (const [table, columns] of Object.entries(source))
+        requiredColumns[table] = [
+          ...(requiredColumns[table] ?? []),
+          ...columns,
+        ];
+    }
     const tableRows = this.database
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -882,28 +1043,11 @@ export class ControllerStore {
       user_version?: unknown;
     };
     const version = asInteger(versionRow.user_version, 'schema version');
-    if (version === SCHEMA_VERSION) return;
-    if (version === PREVIOUS_SCHEMA_VERSION) {
-      this.migrateSchema1To2();
-      return;
-    }
-    if (version !== 0) {
-      throw new Error(
-        `Unsupported controller database schema version ${String(version)}.`,
-      );
-    }
-    const existing = this.database
-      .prepare(
-        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-      )
-      .get() as { count: unknown };
-    if (asInteger(existing.count, 'existing tables') !== 0) {
-      throw new Error(
-        'Unversioned database is not empty; refusing to modify it.',
-      );
-    }
+    if (version !== SCHEMA_VERSION) this.migrateToCurrent(version);
+  }
+
+  private createSchema1(): void {
     this.database.exec(`
-      BEGIN IMMEDIATE;
       CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
       INSERT INTO meta(key, value) VALUES ('next_poll_offset', '0');
       CREATE TABLE processed_updates(
@@ -922,7 +1066,7 @@ export class ControllerStore {
       CREATE TABLE jobs(
         id TEXT PRIMARY KEY, session_id TEXT NOT NULL, owner_id TEXT NOT NULL,
         chat_id TEXT NOT NULL, sequence INTEGER NOT NULL, input TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('QUEUED','RUNNING','WAITING_INPUT','COMPLETED','FAILED')),
+        status TEXT NOT NULL CHECK(status IN ('QUEUED','RUNNING','WAITING_INPUT','CANCELLING','COMPLETED','FAILED','CANCELLED')),
         checkpoint INTEGER NOT NULL CHECK(checkpoint BETWEEN 0 AND 3),
         started_at INTEGER, deadline_at INTEGER, failure_code TEXT,
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -930,7 +1074,7 @@ export class ControllerStore {
         FOREIGN KEY(session_id, owner_id) REFERENCES sessions(id, owner_id)
       ) STRICT;
       CREATE UNIQUE INDEX one_active_job_per_session ON jobs(session_id)
-        WHERE status IN ('RUNNING','WAITING_INPUT');
+        WHERE status IN ('RUNNING','WAITING_INPUT','CANCELLING');
       CREATE INDEX jobs_schedule ON jobs(status, created_at, sequence);
       CREATE TABLE messages(
         id TEXT PRIMARY KEY, session_id TEXT NOT NULL, job_id TEXT NOT NULL,
@@ -962,72 +1106,77 @@ export class ControllerStore {
         created_at INTEGER NOT NULL, PRIMARY KEY(chat_id, message_id),
         FOREIGN KEY(job_id, owner_id) REFERENCES jobs(id, owner_id)
       ) STRICT;
-      PRAGMA user_version = ${String(PREVIOUS_SCHEMA_VERSION)};
-      COMMIT;
     `);
-    this.migrateSchema1To2();
   }
 
-  private migrateSchema1To2(): void {
-    this.database.exec('BEGIN IMMEDIATE');
+  private migrateToCurrent(initialVersion: number): void {
+    this.database.exec('PRAGMA foreign_keys = OFF');
     try {
-      const offset = readPollMetadata(this.database, PREVIOUS_SCHEMA_VERSION);
-      if (offset.legacy) {
-        this.database
-          .prepare("UPDATE meta SET value=? WHERE key='next_poll_offset'")
-          .run(offset.canonical);
-      }
-      this.database.exec(`
-        ALTER TABLE prompt_bindings
-          ADD COLUMN generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0);
-        ALTER TABLE outbox
-          ADD COLUMN prompt_generation INTEGER CHECK(prompt_generation IS NULL OR prompt_generation >= 0);
-        CREATE TABLE flow_runs(
-          job_id TEXT PRIMARY KEY REFERENCES jobs(id),
-          bundle_json TEXT NOT NULL,
-          flow_id TEXT NOT NULL,
-          node_id TEXT NOT NULL,
-          state_json TEXT NOT NULL,
-          revision INTEGER NOT NULL CHECK(revision >= 0),
-          transitions INTEGER NOT NULL CHECK(transitions >= 0),
-          prompt_generation INTEGER NOT NULL CHECK(prompt_generation >= 0),
-          wait_deadline INTEGER,
-          job_deadline INTEGER
-        ) STRICT;
-        CREATE TABLE session_facts(
-          session_id TEXT NOT NULL,
-          owner_id TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          value_json TEXT NOT NULL,
-          source_json TEXT NOT NULL,
-          flow_version TEXT,
-          bank_version TEXT,
-          created_at INTEGER NOT NULL,
-          provenance TEXT NOT NULL CHECK(provenance = 'user_confirmed'),
-          PRIMARY KEY(session_id, kind),
-          FOREIGN KEY(session_id, owner_id) REFERENCES sessions(id, owner_id)
-        ) STRICT;
-        CREATE TABLE pi_sessions(
-          session_id TEXT PRIMARY KEY REFERENCES sessions(id),
-          pi_session_id TEXT NOT NULL UNIQUE,
-          file_path TEXT NOT NULL UNIQUE
-        ) STRICT;
-        CREATE TABLE outbox_cancellations(
-          outbox_id TEXT PRIMARY KEY REFERENCES outbox(id),
-          reason TEXT NOT NULL,
-          created_at INTEGER NOT NULL
-        ) STRICT;
-        CREATE INDEX outbox_cancellations_created ON outbox_cancellations(created_at);
-        PRAGMA user_version = ${String(SCHEMA_VERSION)};
-      `);
-      this.database.exec('COMMIT');
-    } catch {
+      this.database.exec('BEGIN IMMEDIATE');
       try {
-        this.database.exec('ROLLBACK');
+        const versionRow = this.database
+          .prepare('PRAGMA user_version')
+          .get() as { user_version?: unknown };
+        let version = asInteger(versionRow.user_version, 'schema version');
+        if (version !== initialVersion)
+          throw new Error('Controller database migration failed.');
+        if (version === 0) {
+          this.createSchema1();
+          version = 1;
+        }
+        const offset = readPollMetadata(this.database, version);
+        if (offset.legacy)
+          this.database
+            .prepare("UPDATE meta SET value=? WHERE key='next_poll_offset'")
+            .run(offset.canonical);
+        if (version === 1) {
+          this.database.exec(`
+            ALTER TABLE prompt_bindings ADD COLUMN generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0);
+            ALTER TABLE outbox ADD COLUMN prompt_generation INTEGER CHECK(prompt_generation IS NULL OR prompt_generation >= 0);
+            CREATE TABLE flow_runs(job_id TEXT PRIMARY KEY REFERENCES jobs(id), bundle_json TEXT NOT NULL, flow_id TEXT NOT NULL, node_id TEXT NOT NULL, state_json TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision >= 0), transitions INTEGER NOT NULL CHECK(transitions >= 0), prompt_generation INTEGER NOT NULL CHECK(prompt_generation >= 0), wait_deadline INTEGER, job_deadline INTEGER) STRICT;
+            CREATE TABLE session_facts(session_id TEXT NOT NULL, owner_id TEXT NOT NULL, kind TEXT NOT NULL, value_json TEXT NOT NULL, source_json TEXT NOT NULL, flow_version TEXT, bank_version TEXT, created_at INTEGER NOT NULL, provenance TEXT NOT NULL CHECK(provenance = 'user_confirmed'), PRIMARY KEY(session_id,kind), FOREIGN KEY(session_id,owner_id) REFERENCES sessions(id,owner_id)) STRICT;
+            CREATE TABLE pi_sessions(session_id TEXT PRIMARY KEY REFERENCES sessions(id), pi_session_id TEXT NOT NULL UNIQUE, file_path TEXT NOT NULL UNIQUE) STRICT;
+            CREATE TABLE outbox_cancellations(outbox_id TEXT PRIMARY KEY REFERENCES outbox(id), reason TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE INDEX outbox_cancellations_created ON outbox_cancellations(created_at);
+          `);
+          version = 2;
+        }
+        if (version !== 2)
+          throw new Error('Unsupported migration source version.');
+        this.database.exec(`
+          CREATE TABLE jobs_new(
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, owner_id TEXT NOT NULL, chat_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL, input TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('QUEUED','RUNNING','WAITING_INPUT','CANCELLING','COMPLETED','FAILED','CANCELLED')),
+            checkpoint INTEGER NOT NULL CHECK(checkpoint BETWEEN 0 AND 3), started_at INTEGER, deadline_at INTEGER,
+            failure_code TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            UNIQUE(session_id,sequence), UNIQUE(id,owner_id), UNIQUE(id,session_id),
+            FOREIGN KEY(session_id,owner_id) REFERENCES sessions(id,owner_id)
+          ) STRICT;
+          INSERT INTO jobs_new SELECT id,session_id,owner_id,chat_id,sequence,input,status,checkpoint,started_at,deadline_at,failure_code,created_at,updated_at FROM jobs;
+          DROP TABLE jobs;
+          ALTER TABLE jobs_new RENAME TO jobs;
+          CREATE UNIQUE INDEX one_active_job_per_session ON jobs(session_id) WHERE status IN ('RUNNING','WAITING_INPUT','CANCELLING');
+          CREATE INDEX jobs_schedule ON jobs(status,created_at,sequence);
+          ALTER TABLE outbox ADD COLUMN delivery_class TEXT NOT NULL DEFAULT 'business' CHECK(delivery_class IN ('business','control'));
+          ${TRIAL_SCHEMA_DDL}
+          PRAGMA user_version = 3;
+        `);
+        if (
+          this.database.prepare('PRAGMA foreign_key_check').all().length !== 0
+        )
+          throw new Error('Foreign key check failed.');
+        this.database.exec('COMMIT');
       } catch {
-        // Preserve the stable migration classification.
+        try {
+          this.database.exec('ROLLBACK');
+        } catch {
+          /* Preserve safe error. */
+        }
+        throw new Error('Controller database migration failed.');
       }
-      throw new Error('Controller database migration failed.');
+    } finally {
+      this.database.exec('PRAGMA foreign_keys = ON');
     }
   }
 
@@ -1052,6 +1201,7 @@ export class ControllerStore {
     prefix?: string,
     chatId?: string,
     promptGeneration: number | null = null,
+    deliveryClass: 'business' | 'control' = 'business',
   ): void {
     const row =
       sessionId === null
@@ -1092,8 +1242,8 @@ export class ControllerStore {
       this.database
         .prepare(
           `INSERT INTO outbox(id, batch_id, session_id, job_id, kind, chunk_index, text, chat_id,
-                              status, attempts, next_attempt_at, created_at, delivered_at, prompt_generation)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, NULL, ?)`,
+                              status, attempts, next_attempt_at, created_at, delivered_at, prompt_generation, delivery_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, NULL, ?, ?)`,
         )
         .run(
           this.id('out'),
@@ -1107,6 +1257,7 @@ export class ControllerStore {
           now,
           now,
           promptGeneration,
+          deliveryClass,
         );
     }
   }
@@ -1306,10 +1457,7 @@ function readPollMetadata(
   const row = database
     .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
     .get() as { value?: unknown } | undefined;
-  const parsed = parsePollOffset(
-    row?.value,
-    version === PREVIOUS_SCHEMA_VERSION,
-  );
+  const parsed = parsePollOffset(row?.value, version === 1);
   if (parsed === null)
     throw new Error('Controller database metadata is incomplete.');
   return parsed;

@@ -29,7 +29,22 @@ function closeReopenedStores(stores: readonly ControllerStore[]): void {
   for (const store of stores) store.close();
 }
 
+function downgradeToV2(database: DatabaseSync): void {
+  database.exec(`
+    DROP TABLE trial_usage_events;
+    DROP TABLE trial_usage_operations;
+    DROP TABLE command_menu_sync;
+    DROP TABLE command_dialogs;
+    DROP TABLE trial_invites;
+    DROP TABLE trial_events;
+    DROP TABLE trial_users;
+    ALTER TABLE outbox DROP COLUMN delivery_class;
+    PRAGMA user_version = 2;
+  `);
+}
+
 function downgradeToV1(database: DatabaseSync): void {
+  downgradeToV2(database);
   database.exec(`
     DROP TABLE outbox_cancellations;
     DROP TABLE pi_sessions;
@@ -369,7 +384,7 @@ describe('SQLite controller persistence and recovery', () => {
             user_version: number;
           }
         ).user_version,
-      ).toBe(2);
+      ).toBe(3);
       expect(store.getOffset()).toBe(56);
       expect(
         database
@@ -452,7 +467,7 @@ describe('SQLite controller persistence and recovery', () => {
         ).toEqual({ value: '0' });
         expect(
           store.database.prepare('PRAGMA user_version').get(),
-        ).toMatchObject({ user_version: 2 });
+        ).toMatchObject({ user_version: 3 });
       } finally {
         store.close();
       }
@@ -476,7 +491,7 @@ describe('SQLite controller persistence and recovery', () => {
         ).toEqual({ value: String(Number.MAX_SAFE_INTEGER) });
         expect(
           store.database.prepare('PRAGMA user_version').get(),
-        ).toMatchObject({ user_version: 2 });
+        ).toMatchObject({ user_version: 3 });
       } finally {
         store.close();
       }
@@ -566,6 +581,7 @@ describe('SQLite controller persistence and recovery', () => {
     async (offset) => {
       const path = artifactsPath('store-v2-line-terminated-offset');
       const initialized = new ControllerStore(new DatabaseSync(path));
+      downgradeToV2(initialized.database);
       initialized.database
         .prepare("UPDATE meta SET value=? WHERE key='next_poll_offset'")
         .run(offset);
@@ -596,6 +612,7 @@ describe('SQLite controller persistence and recovery', () => {
   it('keeps schema-v2 poll metadata validation strict for legacy decimal strings', async () => {
     const path = artifactsPath('store-v2-decimal-offset');
     const initialized = new ControllerStore(new DatabaseSync(path));
+    downgradeToV2(initialized.database);
     initialized.database
       .prepare("UPDATE meta SET value='1.0' WHERE key='next_poll_offset'")
       .run();

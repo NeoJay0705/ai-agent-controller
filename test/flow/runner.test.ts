@@ -36,6 +36,8 @@ function createRunner(
     readonly now?: () => number;
     readonly limits?: FlowLimits;
     readonly onError?: (error: Error) => void;
+    readonly canRunOwner?: (ownerId: string) => boolean;
+    readonly maxWorkersPerOwner?: (ownerId: string) => number;
   } = {},
 ): FlowRunner {
   const executor = new FlowExecutor(controller, flowStore, fake, {
@@ -45,6 +47,12 @@ function createRunner(
     concurrency: options.concurrency ?? 1,
     now: options.now ?? (() => NOW),
     ...(options.onError === undefined ? {} : { onError: options.onError }),
+    ...(options.canRunOwner === undefined
+      ? {}
+      : { canRunOwner: options.canRunOwner }),
+    ...(options.maxWorkersPerOwner === undefined
+      ? {}
+      : { maxWorkersPerOwner: options.maxWorkersPerOwner }),
   });
 }
 
@@ -293,6 +301,143 @@ describe('FlowRunner scheduling and worker lifetime', () => {
       await runner.stop();
     } finally {
       releaseChild?.();
+      controller.close();
+    }
+  });
+
+  it('keeps a cancelling worker slot until the runtime promise settles before starting the next Session Job', async () => {
+    let release: (() => void) | undefined;
+    let started: (() => void) | undefined;
+    let aborted: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const workerStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const signalAborted = new Promise<void>((resolve) => {
+      aborted = resolve;
+    });
+    const controller = memoryController(() => NOW);
+    const fake = new FakeAgentRuntime({
+      beforeRun: async (input) => {
+        if (input.node.id !== 'recommend') return;
+        started?.();
+        input.signal.addEventListener('abort', () => aborted?.(), {
+          once: true,
+        });
+        await gate;
+      },
+    });
+    try {
+      const first = queueJob(controller, 'first', {
+        name: 'cancel-first',
+        chatId: '515151',
+      });
+      const second = queueJob(controller, 'second', {
+        name: 'cancel-second',
+        chatId: '616161',
+      });
+      const flowStore = testFlowStore(controller, () => NOW);
+      const runner = createRunner(controller, flowStore, fake, {
+        concurrency: 1,
+      });
+      runner.tick();
+      await workerStarted;
+      controller.transaction(() =>
+        controller.requestCancellation(FLOW_USER_ID, first.jobId, FLOW_USER_ID),
+      );
+      runner.tick();
+      await signalAborted;
+      expect(controller.statusForJob(FLOW_USER_ID, first.jobId)?.status).toBe(
+        'CANCELLING',
+      );
+      expect(controller.statusForJob(FLOW_USER_ID, second.jobId)?.status).toBe(
+        'QUEUED',
+      );
+      runner.tick();
+      expect(controller.statusForJob(FLOW_USER_ID, second.jobId)?.status).toBe(
+        'QUEUED',
+      );
+      release?.();
+      await waitUntil(
+        () =>
+          controller.statusForJob(FLOW_USER_ID, first.jobId)?.status ===
+          'CANCELLED',
+      );
+      await waitUntil(() => {
+        runner.tick();
+        return (
+          controller.statusForJob(FLOW_USER_ID, second.jobId)?.status ===
+          'WAITING_INPUT'
+        );
+      });
+      await runner.stop();
+    } finally {
+      release?.();
+      controller.close();
+    }
+  });
+
+  it('limits workers per owner across Sessions while allowing another owner to run', async () => {
+    let release: (() => void) | undefined;
+    const starts: string[] = [];
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const controller = memoryController(() => NOW);
+    const fake = new FakeAgentRuntime({
+      beforeRun: async (input) => {
+        if (input.node.id !== 'recommend') return;
+        starts.push(input.jobId);
+        await gate;
+      },
+    });
+    try {
+      const first = queueJob(controller, 'first', {
+        name: 'owner-one',
+        chatId: '515151',
+      });
+      const second = queueJob(controller, 'second', {
+        name: 'owner-two',
+        chatId: '616161',
+      });
+      const guest = queueJob(controller, 'guest', {
+        name: 'guest-one',
+        ownerId: 'guest-owner',
+        chatId: '717171',
+      });
+      const flowStore = testFlowStore(controller, () => NOW);
+      const runner = createRunner(controller, flowStore, fake, {
+        concurrency: 2,
+        maxWorkersPerOwner: () => 1,
+      });
+      runner.tick();
+      await waitUntil(() => starts.length === 2);
+      expect(starts).toContain(first.jobId);
+      expect(starts).toContain(guest.jobId);
+      expect(starts).not.toContain(second.jobId);
+      expect(controller.statusForJob(FLOW_USER_ID, second.jobId)?.status).toBe(
+        'QUEUED',
+      );
+      release?.();
+      await waitUntil(
+        () =>
+          controller.statusForJob(FLOW_USER_ID, first.jobId)?.status ===
+            'WAITING_INPUT' &&
+          controller.statusForJob('guest-owner', guest.jobId)?.status ===
+            'WAITING_INPUT',
+      );
+      await waitUntil(() => {
+        runner.tick();
+        return (
+          controller.statusForJob(FLOW_USER_ID, second.jobId)?.status ===
+          'WAITING_INPUT'
+        );
+      });
+      await runner.stop();
+    } finally {
+      release?.();
       controller.close();
     }
   });

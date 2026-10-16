@@ -32,6 +32,7 @@ interface GuardTestOverrides {
     readonly mode: 'pi-login';
     readonly expiresAt: number;
   };
+  readonly tokenBudget?: number;
 }
 
 interface FakeTool {
@@ -322,6 +323,52 @@ describe('Pi RPC host guard extension', () => {
     expect(JSON.stringify(replacement)).not.toContain(SYNTHETIC_OAUTH_ACCESS);
   });
 
+  it('tracks settled usage and aborts a later request at the token limit', async () => {
+    const { api } = await createGuard({ tokenBudget: 5 });
+    const context = new FakeContext();
+    api.invoke('before_agent_start', validUserEvent(), context);
+    api.invoke(
+      'before_provider_request',
+      { type: 'before_provider_request' },
+      context,
+    );
+    expect(
+      context.notifications.some((item) =>
+        item.message.includes('flow-host-request'),
+      ),
+    ).toBe(true);
+    api.invoke(
+      'message_end',
+      {
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          content: [],
+          usage: {
+            input: 3,
+            output: 2,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 5,
+          },
+        },
+      },
+      context,
+    );
+    api.invoke(
+      'before_provider_request',
+      { type: 'before_provider_request' },
+      context,
+    );
+    expect(readFailure(context)).toBe('FLOW_TOKEN_LIMIT');
+    expect(context.aborted).toBe(true);
+    expect(
+      context.notifications.filter((item) =>
+        item.message.includes('flow-host-request'),
+      ),
+    ).toHaveLength(1);
+  });
+
   it('blocks an OAuth request when the snapshot expires during the child run', async () => {
     const { api, config } = await createOAuthGuard();
     const context = new FakeContext();
@@ -503,6 +550,9 @@ function createGuardConfig(overrides: GuardTestOverrides = {}) {
     model: 'gpt-6-luna',
     thinking: 'max',
     tools: [...(overrides.tools ?? [])],
+    ...(overrides.tokenBudget === undefined
+      ? {}
+      : { tokenBudget: overrides.tokenBudget }),
     effectiveLimits: {
       nodeTimeoutMs: 10_000,
       waitTimeoutMs: 3_600_000,

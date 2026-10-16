@@ -1,6 +1,7 @@
 import { isAbsolute, resolve } from 'node:path';
 
 import type { ControllerConfig } from './types.js';
+import { parseTrialPolicy } from './trial-policy.js';
 
 export type Environment = Readonly<Record<string, string | undefined>>;
 
@@ -83,6 +84,7 @@ export function parseControllerConfig(
       allowedUserId: String(Number(userValue)),
       flowConfigPath,
       ...(piAuthFile === undefined ? {} : { piAuthFile }),
+      trial: parseTrialPolicy(env),
     };
   }
   return { ...common, mode: 'health' };
