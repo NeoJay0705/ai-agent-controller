@@ -303,7 +303,9 @@ describe('durable demo runner', () => {
 
   it('consumes steering submitted at checkpoint two before completion and rejects steering after completion', () => {
     const store = memoryStore({ now: () => 1000 });
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), {
+      readyAtSec: () => 0,
+    });
     router.handle(makeUpdate(1, '/new race-session'));
     router.handle(makeUpdate(2, '/queue finish-at-three'));
     const job = store.database.prepare('SELECT id FROM jobs').get() as {
@@ -372,7 +374,9 @@ describe('durable demo runner', () => {
 
   it('keeps steering pending during RUNNING until a safe point and preserves its order in output', () => {
     const store = memoryStore({ now: () => 2000 });
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), {
+      readyAtSec: () => 0,
+    });
     router.handle(makeUpdate(1, '/new steering-order'));
     router.handle(makeUpdate(2, '/queue ordered-output'));
     const job = store.database.prepare('SELECT id FROM jobs').get() as {

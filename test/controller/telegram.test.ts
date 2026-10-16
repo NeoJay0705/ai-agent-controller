@@ -249,6 +249,29 @@ describe('Telegram HTTP client protocol handling', () => {
     ).rejects.not.toThrow(TOKEN);
   });
 
+  it('defers text type validation until after the Router date gate', async () => {
+    const client = new TelegramClient(TOKEN, () =>
+      response({
+        ok: true,
+        result: [
+          {
+            update_id: 1,
+            message: {
+              message_id: 2,
+              date: 3,
+              chat: { id: 4, type: 'private' },
+              from: { id: 4 },
+              text: 42,
+            },
+          },
+        ],
+      }),
+    );
+    await expect(
+      client.getUpdates(0, new AbortController().signal),
+    ).resolves.toMatchObject([{ update_id: 1, message: { date: 3 } }]);
+  });
+
   it('rejects malformed update IDs and contradictory Telegram envelopes', async () => {
     const invalidUpdate = new TelegramClient(TOKEN, () =>
       response({

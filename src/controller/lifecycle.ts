@@ -1,9 +1,10 @@
-import { open, mkdir, chmod, unlink } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import type { ControllerConfig } from './types.js';
 import { ControllerStore, restrictDatabaseFile } from './store.js';
+import { acquireControllerKernelLock } from './lock.js';
 
 export interface ControllerResources {
   readonly store: ControllerStore;
@@ -19,66 +20,52 @@ export async function openControllerResources(
 ): Promise<ControllerResources> {
   if (config.mode !== 'bot') throw new Error('Bot configuration is required.');
   await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-  await chmod(config.dataDir, 0o700);
-  const lockPath = join(config.dataDir, 'controller.lock');
-  let ownsLock = false;
+  let lease: Awaited<ReturnType<typeof acquireControllerKernelLock>> | null =
+    null;
   let store: ControllerStore | null = null;
-  let closed = false;
+  let database: DatabaseSync | null = null;
+  let closePromise: Promise<void> | null = null;
   try {
-    const lock = await open(lockPath, 'wx', 0o600).catch((error: unknown) => {
-      if (isAlreadyExists(error))
-        throw new Error('Controller lock already exists.');
-      throw new Error('Could not create controller lock.');
-    });
-    ownsLock = true;
-    try {
-      await lock.writeFile(`${String(process.pid)}\n`, 'utf8');
-      await lock.sync();
-    } finally {
-      await lock.close();
-    }
+    lease = await acquireControllerKernelLock(config.dataDir);
     const databasePath = join(config.dataDir, 'controller.sqlite');
-    const database = new DatabaseSync(databasePath);
+    database = new DatabaseSync(databasePath);
     store = new ControllerStore(database, options);
     await restrictDatabaseFile(databasePath);
     const openedStore = store;
+    const heldLease = lease;
     return {
       store: openedStore,
-      close: async () => {
-        if (closed) return;
-        closed = true;
-        openedStore.close();
-        if (ownsLock) {
-          ownsLock = false;
-          await unlink(lockPath);
-        }
+      close: () => {
+        if (closePromise !== null) return closePromise;
+        closePromise = (async () => {
+          openedStore.close();
+          await heldLease.release();
+        })();
+        return closePromise;
       },
     };
   } catch (error) {
+    let databaseClosed = store === null && database === null;
     if (store !== null) {
       try {
         store.close();
+        databaseClosed = true;
       } catch {
-        // Preserve startup error.
+        // Preserve startup error and keep the kernel lease held.
+      }
+    } else if (database !== null) {
+      if (!database.isOpen) databaseClosed = true;
+      else {
+        try {
+          database.close();
+          databaseClosed = true;
+        } catch {
+          // Preserve startup error and keep the kernel lease held.
+        }
       }
     }
-    if (ownsLock) {
-      ownsLock = false;
-      try {
-        await unlink(lockPath);
-      } catch {
-        // Preserve startup error. The lock was created by this startup attempt.
-      }
-    }
+    if (lease !== null && databaseClosed)
+      await lease.release().catch(() => undefined);
     throw error;
   }
-}
-
-function isAlreadyExists(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    error.code === 'EEXIST'
-  );
 }

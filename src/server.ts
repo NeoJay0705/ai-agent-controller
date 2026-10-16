@@ -12,6 +12,10 @@ import {
 } from './controller/service.js';
 import { TelegramClient, type FetchLike } from './controller/telegram.js';
 import type { ControllerConfig } from './controller/types.js';
+import {
+  assertFlowAuthConfiguration,
+  loadFlowBundleConfig,
+} from './flow/config-file.js';
 
 export interface ServerOptions {
   readonly env?: Environment;
@@ -30,7 +34,18 @@ export interface RunningServer {
 export async function startServer(
   options: ServerOptions = {},
 ): Promise<RunningServer> {
-  const config = parseControllerConfig(options.env ?? process.env, options.cwd);
+  const environment = options.env ?? process.env;
+  const config = parseControllerConfig(environment, options.cwd);
+  const bundle =
+    config.mode === 'bot'
+      ? await loadFlowBundleConfig(config.flowConfigPath)
+      : undefined;
+  if (config.mode === 'bot') {
+    if (bundle === undefined) {
+      throw new Error('Flow configuration is required in bot mode.');
+    }
+    assertFlowAuthConfiguration(bundle, config.piAuthFile);
+  }
   const app = buildApp({ logger: true });
   let resources:
     Awaited<ReturnType<typeof openControllerResources>> | undefined;
@@ -39,13 +54,24 @@ export async function startServer(
   let closeServer: () => Promise<void> = () => Promise.resolve();
   try {
     if (config.mode === 'bot') {
-      resources = await openControllerResources(config);
+      if (bundle === undefined) {
+        throw new Error('Flow configuration is required in bot mode.');
+      }
+      resources = await openControllerResources(config, {
+        ...(options.service?.clock === undefined
+          ? {}
+          : { now: () => options.service?.clock?.now() ?? Date.now() }),
+      });
+      const environmentResolver = (name: string): string | undefined =>
+        environment[name];
       service = new ControllerService(
         config,
         resources,
         new TelegramClient(config.token, options.fetcher),
+        bundle,
         {
           ...options.service,
+          environment: environmentResolver,
           onFatal: (classification) => {
             process.exitCode = 1;
             setImmediate(() => {

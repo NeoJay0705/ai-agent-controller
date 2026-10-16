@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import { TelegramRouter } from '../../src/controller/router.js';
+import { FlowExecutor } from '../../src/flow/executor.js';
+import { FakeAgentRuntime, testFlowStore } from '../flow/helpers.js';
 import {
   memoryStore,
   makeUpdate,
@@ -11,9 +13,64 @@ import {
 } from './helpers.js';
 
 describe('Telegram router and durable update handling', () => {
+  const routerOptions = { readyAtSec: () => 0 };
+  it('gates on the envelope date before authorization or text access', () => {
+    const store = memoryStore();
+    const skipped: string[] = [];
+    const router = new TelegramRouter(store, testConfig(), {
+      readyAtSec: () => 10,
+      onSkipped: (classification) => skipped.push(classification),
+    });
+    const early = makeUpdate(1, 'DO_NOT_READ_EARLY', { date: 9 });
+    if (early.message === undefined) throw new Error('Expected a message.');
+    Object.defineProperty(early.message, 'text', {
+      get() {
+        throw new Error('early message text was read');
+      },
+    });
+    expect(() => {
+      router.handle(early);
+    }).not.toThrow();
+
+    const invalid = makeUpdate(2, 'DO_NOT_READ_INVALID', { date: -1 });
+    if (invalid.message === undefined) throw new Error('Expected a message.');
+    Object.defineProperty(invalid.message, 'text', {
+      get() {
+        throw new Error('invalid-date message text was read');
+      },
+    });
+    expect(() => {
+      router.handle(invalid);
+    }).not.toThrow();
+
+    const atBoundary = makeUpdate(3, '/new accepted-at-boundary', { date: 10 });
+    router.handle(atBoundary);
+    const malformedText = makeUpdate(4, 'not-a-string', { date: 10 });
+    if (malformedText.message === undefined)
+      throw new Error('Expected a message.');
+    Object.defineProperty(malformedText.message, 'text', { value: 42 });
+    router.handle(malformedText);
+
+    expect(store.listSessions(USER_ID).map((session) => session.name)).toEqual([
+      'accepted-at-boundary',
+    ]);
+    expect(
+      store.database.prepare('SELECT COUNT(*) AS count FROM jobs').get(),
+    ).toMatchObject({ count: 0 });
+    expect(store.getOffset()).toBe(5);
+    expect(skipped).toEqual(['before_ready', 'invalid_message_date']);
+    const replies = store
+      .dueOutbox(Date.now())
+      .map((item) => item.text)
+      .join('\n');
+    expect(replies).toContain('Only text messages are supported.');
+    expect(replies).not.toContain('DO_NOT_READ');
+    store.close();
+  });
+
   it('authorizes private user IDs, ignores other updates, deduplicates, and advances offset', () => {
     const store = memoryStore();
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     router.handle(makeUpdate(5, '/new private'));
     router.handle(
       makeUpdate(6, '/new should-not-exist', { chatType: 'group' }),
@@ -41,7 +98,7 @@ describe('Telegram router and durable update handling', () => {
 
   it('creates and switches sessions, queues text, steers a fixed job, and answers queries directly', () => {
     const store = memoryStore();
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     router.handle(makeUpdate(1, '/new first'));
     const first = store.selectedSession(USER_ID, CHAT_ID);
     expect(first).not.toBeNull();
@@ -92,7 +149,7 @@ describe('Telegram router and durable update handling', () => {
 
   it('rejects missing selection, malformed commands, non-text, whitespace, and over-limit messages without partial jobs', () => {
     const store = memoryStore();
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     router.handle(makeUpdate(1, 'ordinary text'));
     router.handle(makeUpdate(2, '/queue data'));
     router.handle(makeUpdate(3, '   '));
@@ -112,17 +169,24 @@ describe('Telegram router and durable update handling', () => {
     store.close();
   });
 
-  it('routes an active prompt reply to its original job after switching sessions and rejects expired replies', () => {
+  it('routes an active prompt reply to its original job after switching sessions and rejects expired replies', async () => {
     const now = 10_000;
     const store = memoryStore({ now: () => now });
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     router.handle(makeUpdate(1, '/new original'));
-    router.handle(makeUpdate(2, 'ask: details'));
+    router.handle(makeUpdate(2, 'flow request'));
     const job = store.database.prepare('SELECT id FROM jobs').get() as {
       id: string;
     };
-    store.scheduleAvailable(now, 1, 60_000);
-    store.advanceStep(job.id, now + 1);
+    const flowStore = testFlowStore(store, () => now);
+    const executor = new FlowExecutor(
+      store,
+      flowStore,
+      new FakeAgentRuntime(),
+      { now: () => now },
+    );
+    flowStore.reserveReadyJobs(now, 1);
+    await executor.execute(job.id, new AbortController().signal);
     const prompt = store
       .dueOutbox(now + 1)
       .find((item) => item.kind === 'prompt');
@@ -147,13 +211,7 @@ describe('Telegram router and durable update handling', () => {
     ).toMatchObject({ job_id: job.id, steering_state: 'pending' });
     expect(store.selectedSession(USER_ID, CHAT_ID)?.name).toBe('other');
 
-    store.transaction(() => {
-      store.database
-        .prepare(
-          'UPDATE prompt_bindings SET active=0 WHERE chat_id=? AND message_id=?',
-        )
-        .run(CHAT_ID, 9001);
-    });
+    store.deactivatePrompts(job.id, 'PROMPT_SUPERSEDED');
     router.handle(makeUpdate(5, 'late reply', { replyTo: 9001 }));
     expect(
       store.database.prepare('SELECT COUNT(*) AS count FROM jobs').get(),
@@ -205,7 +263,7 @@ describe('Telegram router and durable update handling', () => {
 
   it('does not reveal whether another owner has a session or job', () => {
     const store = memoryStore();
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     store.transaction(() =>
       store.createSession('111111', '111111', 'private-name'),
     );
@@ -225,7 +283,7 @@ describe('Telegram router and durable update handling', () => {
 
   it('does not authorize a different ID with the same username', () => {
     const store = memoryStore();
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     const unauthorized = makeUpdate(1, '/new impostor', { userId: 989898 });
     const message = unauthorized.message;
     if (message === undefined) throw new Error('Expected test message.');
@@ -247,7 +305,7 @@ describe('Telegram router and durable update handling', () => {
 
   it('filters /sessions by owner and gives identical /use and /status errors for private and missing IDs', () => {
     const store = memoryStore();
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     router.handle(makeUpdate(1, '/new own-session'));
     const another = store.transaction(() => {
       const session = store.createSession('111111', '111111', 'private-name');
@@ -296,26 +354,31 @@ describe('Telegram router and durable update handling', () => {
     store.close();
   });
 
-  it('creates a Job for /queue and enforces MAX_PENDING_JOBS in every active state without partial writes', () => {
+  it('creates a Job for /queue and enforces MAX_PENDING_JOBS in every active state without partial writes', async () => {
     for (const stage of ['QUEUED', 'RUNNING', 'WAITING_INPUT'] as const) {
       const store = memoryStore({ now: () => 1000 });
       const router = new TelegramRouter(
         store,
         testConfig({ MAX_PENDING_JOBS: '1' }),
+        routerOptions,
       );
       router.handle(makeUpdate(1, '/new capacity'));
-      router.handle(
-        makeUpdate(
-          2,
-          stage === 'WAITING_INPUT' ? '/queue ask: details' : '/queue first',
-        ),
-      );
+      router.handle(makeUpdate(2, '/queue first'));
       const first = store.database.prepare('SELECT id FROM jobs').get() as {
         id: string;
       };
-      if (stage !== 'QUEUED') {
+      if (stage === 'RUNNING') {
         store.scheduleAvailable(1000, 1, 60_000);
-        if (stage === 'WAITING_INPUT') store.advanceStep(first.id, 1001);
+      } else if (stage === 'WAITING_INPUT') {
+        const flowStore = testFlowStore(store, () => 1000);
+        const executor = new FlowExecutor(
+          store,
+          flowStore,
+          new FakeAgentRuntime(),
+          { now: () => 1000 },
+        );
+        flowStore.reserveReadyJobs(1000, 1);
+        await executor.execute(first.id, new AbortController().signal);
       }
       expect(store.statusForJob(USER_ID, first.id)?.status).toBe(stage);
       const sequenceBefore = store.database
@@ -360,6 +423,7 @@ describe('Telegram router and durable update handling', () => {
     const router = new TelegramRouter(
       store,
       testConfig({ MAX_PENDING_STEERING: '1' }),
+      routerOptions,
     );
     router.handle(makeUpdate(1, '/new steering-limit'));
     router.handle(makeUpdate(2, '/queue target'));
@@ -392,17 +456,24 @@ describe('Telegram router and durable update handling', () => {
     store.close();
   });
 
-  it('gives explicit /queue precedence over an active prompt reply', () => {
+  it('gives explicit /queue precedence over an active prompt reply', async () => {
     const now = 1000;
     const store = memoryStore({ now: () => now });
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     router.handle(makeUpdate(1, '/new prompt-priority'));
-    router.handle(makeUpdate(2, '/queue ask: details'));
+    router.handle(makeUpdate(2, '/queue MBTI request'));
     const first = store.database.prepare('SELECT id FROM jobs').get() as {
       id: string;
     };
-    store.scheduleAvailable(now, 1, 60_000);
-    store.advanceStep(first.id, now + 1);
+    const flowStore = testFlowStore(store, () => now);
+    const executor = new FlowExecutor(
+      store,
+      flowStore,
+      new FakeAgentRuntime(),
+      { now: () => now },
+    );
+    flowStore.reserveReadyJobs(now, 1);
+    await executor.execute(first.id, new AbortController().signal);
     const prompt = store
       .dueOutbox(now + 1)
       .find((item) => item.kind === 'prompt');
@@ -417,7 +488,7 @@ describe('Telegram router and durable update handling', () => {
         .prepare('SELECT id, input, status FROM jobs ORDER BY sequence')
         .all(),
     ).toMatchObject([
-      { id: first.id, input: 'ask: details', status: 'WAITING_INPUT' },
+      { id: first.id, input: 'MBTI request', status: 'WAITING_INPUT' },
       { input: 'explicit job', status: 'QUEUED' },
     ]);
     expect(
@@ -431,7 +502,7 @@ describe('Telegram router and durable update handling', () => {
   it('throws and rolls back actual SQLite router faults, then accepts the same update once', () => {
     const store = memoryStore();
     const sessionId = createSession(store);
-    const router = new TelegramRouter(store, testConfig());
+    const router = new TelegramRouter(store, testConfig(), routerOptions);
     const beforeOutbox = store.database
       .prepare('SELECT COUNT(*) AS count FROM outbox')
       .get();

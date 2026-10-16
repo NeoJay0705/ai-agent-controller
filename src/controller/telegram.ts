@@ -238,9 +238,6 @@ function validateMessage(value: unknown): TelegramMessage {
     if (!isRecord(from) || positiveSafeInteger(from['id']) === null)
       throw new TelegramError('transient');
   }
-  if (value['text'] !== undefined && typeof value['text'] !== 'string') {
-    throw new TelegramError('transient');
-  }
   if (value['reply_to_message'] !== undefined) {
     const reply = value['reply_to_message'];
     if (!isRecord(reply) || positiveSafeInteger(reply['message_id']) === null) {

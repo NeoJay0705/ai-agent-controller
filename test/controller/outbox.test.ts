@@ -3,6 +3,10 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { retryDelay } from '../../src/controller/service.js';
 import { ControllerStore, splitMessage } from '../../src/controller/store.js';
+import { createFlowBundle } from '../../src/flow/definitions.js';
+import { FlowRegistry } from '../../src/flow/registry.js';
+import { FlowStore } from '../../src/flow/store.js';
+import type { FlowLimits, FlowRuntime } from '../../src/flow/types.js';
 import { TelegramError } from '../../src/controller/telegram.js';
 import type { OutboxRecord } from '../../src/controller/types.js';
 import {
@@ -75,6 +79,65 @@ describe('durable outbox and prompt bindings', () => {
     store.close();
   });
 
+  it('does not let unsendable RUNNING prompts hide valid due notifications beyond the limit', () => {
+    const now = 100;
+    const store = memoryStore({ now: () => now });
+    try {
+      const stalePromptIds: string[] = [];
+      for (let index = 0; index < 25; index += 1) {
+        const ownerId = `stale-owner-${String(index)}`;
+        const chatId = `stale-chat-${String(index)}`;
+        const sessionId = store.transaction(
+          () =>
+            store.createSession(ownerId, chatId, `stale-${String(index)}`).id,
+        );
+        const jobId = store.transaction(() =>
+          store.queueJob(ownerId, chatId, 'stale prompt job', 100),
+        );
+        store.transaction(() => {
+          store.database
+            .prepare("UPDATE outbox SET status='DELIVERED' WHERE session_id=?")
+            .run(sessionId);
+          store.database
+            .prepare("UPDATE jobs SET status='RUNNING' WHERE id=?")
+            .run(jobId);
+          store.enqueueJobNotification(
+            jobId,
+            'prompt',
+            `stale prompt ${String(index)}`,
+            0,
+          );
+        });
+        const prompt = store.database
+          .prepare("SELECT id FROM outbox WHERE job_id=? AND kind='prompt'")
+          .get(jobId) as { id: string };
+        stalePromptIds.push(prompt.id);
+      }
+      store.reply(CHAT_ID, 'valid notification');
+
+      const due = store.dueOutbox(now);
+      expect(due.map((item) => item.text)).toContain('valid notification');
+      expect(due.some((item) => item.kind === 'prompt')).toBe(false);
+      expect(stalePromptIds.every((id) => !store.isOutboxSendable(id))).toBe(
+        true,
+      );
+      expect(
+        store.database
+          .prepare(
+            "SELECT COUNT(*) AS count FROM outbox WHERE kind='prompt' AND status='PENDING'",
+          )
+          .get(),
+      ).toMatchObject({ count: 25 });
+      expect(
+        store.database
+          .prepare('SELECT COUNT(*) AS count FROM outbox_cancellations')
+          .get(),
+      ).toMatchObject({ count: 0 });
+    } finally {
+      store.close();
+    }
+  });
+
   it('persists delivered prompt mapping across reopen, closes it on terminal state, and does not redeliver', async () => {
     await ensureArtifactsDirectory();
     const path = artifactsPath('prompt-reopen');
@@ -118,6 +181,138 @@ describe('durable outbox and prompt bindings', () => {
     });
     store.close();
     await removeDatabaseArtifacts(path);
+  });
+
+  it('cancels stale prompt generations and maps only the current waiting prompt', () => {
+    let now = 2000;
+    const store = memoryStore({ now: () => now });
+    try {
+      createSession(store, 'generation-session');
+      const jobId = store.transaction(() =>
+        store.queueJob(USER_ID, CHAT_ID, 'generation test', 10),
+      );
+      const runtime: FlowRuntime = {
+        provider: 'openai',
+        model: 'gpt-6-luna',
+        thinking: 'max',
+        apiKeyEnv: 'FLOW_TEST_API_KEY',
+      };
+      const limits: FlowLimits = {
+        nodeTimeoutMs: 1000,
+        waitTimeoutMs: 5000,
+        jobTimeoutMs: 20_000,
+        maxTransitions: 20,
+        maxRetries: 1,
+        maxModelTurns: 10,
+        maxToolCalls: 2,
+        maxOutputChars: 5000,
+      };
+      const registry = new FlowRegistry(
+        createFlowBundle({
+          runtimes: { intake: runtime, mbti: runtime, natal: runtime },
+          limits: { intake: limits, mbti: limits, natal: limits },
+        }),
+      );
+      const flowStore = new FlowStore(store, registry, { now: () => now });
+      flowStore.getOrCreatePinnedFlowRun(jobId, 'intake');
+      flowStore.wait({
+        jobId,
+        expectedRevision: 0,
+        currentNodeId: 'recommend',
+        transition: 'ready',
+        agentResult: {
+          transition: 'ready',
+          result: { suggestedFlow: 'mbti' },
+        },
+        state: { stage: 'first-question' },
+        waitPrompt: 'Choose a Flow.',
+      });
+      const firstPrompt = store
+        .dueOutbox(now)
+        .find((item) => item.kind === 'prompt');
+      if (firstPrompt === undefined)
+        throw new Error('Expected the first prompt.');
+      expect(firstPrompt.promptGeneration).toBe(1);
+      expect(store.isOutboxSendable(firstPrompt.id)).toBe(true);
+
+      now += 100;
+      flowStore.wait({
+        jobId,
+        expectedRevision: 1,
+        currentNodeId: 'choose',
+        transition: 'mbti',
+        target: { flowId: 'mbti', nodeId: 'collect' },
+        state: { stage: 'second-question' },
+        waitPrompt: 'Please answer the next question.',
+      });
+      expect(store.isOutboxSendable(firstPrompt.id)).toBe(false);
+      expect(store.dueOutbox(now).map((item) => item.id)).not.toContain(
+        firstPrompt.id,
+      );
+      expect(
+        store.database
+          .prepare('SELECT reason FROM outbox_cancellations WHERE outbox_id=?')
+          .get(firstPrompt.id),
+      ).toEqual({ reason: 'PROMPT_SUPERSEDED' });
+
+      // Simulate an already-started Telegram send completing after supersession.
+      store.deliverOutbox(firstPrompt.id, Number(CHAT_ID), 7711, now + 1);
+      expect(store.findPrompt(CHAT_ID, 7711)).toMatchObject({
+        jobId,
+        active: false,
+        generation: 1,
+      });
+      const secondPrompt = store
+        .dueOutbox(now + 1)
+        .find((item) => item.kind === 'prompt');
+      if (secondPrompt === undefined)
+        throw new Error('Expected the second prompt.');
+      expect(secondPrompt.promptGeneration).toBe(2);
+      expect(store.isOutboxSendable(secondPrompt.id)).toBe(true);
+      store.deliverOutbox(secondPrompt.id, Number(CHAT_ID), 7712, now + 2);
+      expect(store.findPrompt(CHAT_ID, 7712)).toMatchObject({
+        jobId,
+        active: true,
+        generation: 2,
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it('does not activate a delivered prompt after its Job leaves WAITING_INPUT', () => {
+    const store = memoryStore({ now: () => 100 });
+    try {
+      createSession(store, 'late-prompt-session');
+      const jobId = store.transaction(() =>
+        store.queueJob(USER_ID, CHAT_ID, 'late prompt test', 10),
+      );
+      store.transaction(() => {
+        store.enqueueJobNotification(jobId, 'prompt', 'Prompt', 0);
+        store.database
+          .prepare("UPDATE jobs SET status='WAITING_INPUT' WHERE id=?")
+          .run(jobId);
+      });
+      const prompt = store
+        .dueOutbox(100)
+        .find((item) => item.kind === 'prompt');
+      if (prompt === undefined) throw new Error('Expected a prompt.');
+      expect(store.isOutboxSendable(prompt.id)).toBe(true);
+
+      store.database
+        .prepare("UPDATE jobs SET status='RUNNING' WHERE id=?")
+        .run(jobId);
+      store.deliverOutbox(prompt.id, Number(CHAT_ID), 7713, 101);
+
+      expect(store.isOutboxSendable(prompt.id)).toBe(false);
+      expect(store.findPrompt(CHAT_ID, 7713)).toMatchObject({
+        jobId,
+        active: false,
+        generation: 0,
+      });
+    } finally {
+      store.close();
+    }
   });
 
   it('stores bounded chunks in SQLite with one repeated session/job prefix per part', () => {

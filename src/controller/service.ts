@@ -1,5 +1,11 @@
+import type { AgentRuntime, FlowBundle } from '../flow/types.js';
+import { FlowExecutor } from '../flow/executor.js';
+import { assertFlowAuthConfiguration } from '../flow/config-file.js';
+import { FlowRegistry } from '../flow/registry.js';
+import { FlowRunner } from '../flow/runner.js';
+import { FlowStore } from '../flow/store.js';
+import { PiCliRpcRuntime } from '../flow/pi-rpc-runtime.js';
 import type { ControllerConfig, ServiceLogger } from './types.js';
-import { DemoRunner } from './runner.js';
 import { TelegramRouter } from './router.js';
 import { TelegramClient, TelegramError } from './telegram.js';
 import type { ControllerResources } from './lifecycle.js';
@@ -11,11 +17,22 @@ export interface ServiceOptions {
   readonly onFatal?: (classification: string) => void;
   readonly pollIntervalMs?: number;
   readonly outboxIntervalMs?: number;
+  readonly environment?: (name: string) => string | undefined;
+  /** Test-only AgentRuntime injection. Production always uses PiCliRpcRuntime. */
+  readonly agentRuntimeForTests?: AgentRuntime;
 }
+
+const READY_NOTICE = 'Controller is READY. 請重新傳送啟動期間的訊息。';
+const ORCHESTRATION_FAILURES = new Set([
+  'FLOW_STORAGE_INVALID',
+  'FLOW_SCHEDULER_FAILED',
+  'FLOW_RUNTIME_DISPOSED',
+  'FLOW_EXECUTION_FAILED',
+]);
 
 export class ControllerService {
   readonly router: TelegramRouter;
-  readonly runner: DemoRunner;
+  readonly runner: FlowRunner;
   private readonly resources: ControllerResources;
   private readonly telegram: TelegramClient;
   private readonly now: () => number;
@@ -27,8 +44,12 @@ export class ControllerService {
   private readonly onFatal: (classification: string) => void;
   private readonly pollIntervalMs: number;
   private readonly outboxIntervalMs: number;
+  private readonly flowStore: FlowStore;
+  private readonly allowedUserId: string;
   private readonly abortController = new AbortController();
   private loops: Promise<void>[] = [];
+  private startupTask: Promise<void> | null = null;
+  private readyAtSec: number | null = null;
   private started = false;
   private stopping: Promise<void> | null = null;
   private fatal = false;
@@ -37,8 +58,14 @@ export class ControllerService {
     config: ControllerConfig,
     resources: ControllerResources,
     telegram: TelegramClient,
+    bundle: FlowBundle,
     options: ServiceOptions = {},
   ) {
+    if (config.mode !== 'bot') {
+      throw new TypeError('Bot configuration is required.');
+    }
+    assertFlowAuthConfiguration(bundle, config.piAuthFile);
+    this.allowedUserId = config.allowedUserId;
     this.resources = resources;
     this.telegram = telegram;
     this.now = () => options.clock?.now() ?? Date.now();
@@ -47,26 +74,62 @@ export class ControllerService {
     this.onFatal = options.onFatal ?? (() => undefined);
     this.pollIntervalMs = options.pollIntervalMs ?? 100;
     this.outboxIntervalMs = options.outboxIntervalMs ?? 100;
-    this.router = new TelegramRouter(resources.store, config);
-    this.runner = new DemoRunner(resources.store, config, {
-      clock: { now: this.now },
-      sleep: this.sleep,
-      onError: () => {
-        this.logger.error('runner storage or execution error');
+
+    const registry = new FlowRegistry(bundle);
+    this.flowStore = new FlowStore(resources.store, registry, {
+      now: this.now,
+    });
+    const agentRuntime =
+      options.agentRuntimeForTests ??
+      new PiCliRpcRuntime({
+        dataDir: config.dataDir,
+        flowStore: this.flowStore,
+        ...(config.piAuthFile === undefined
+          ? {}
+          : { piAuthFile: config.piAuthFile }),
+        ...(options.environment === undefined
+          ? {}
+          : { environment: options.environment }),
+      });
+    const executor = new FlowExecutor(
+      resources.store,
+      this.flowStore,
+      agentRuntime,
+      { now: this.now },
+    );
+    this.runner = new FlowRunner(resources.store, this.flowStore, executor, {
+      concurrency: config.concurrency,
+      now: this.now,
+      onError: (error) => {
+        const code = safeClassification(error);
+        if (ORCHESTRATION_FAILURES.has(code)) {
+          this.failController(code);
+        } else {
+          this.logger.warn(`runner stopped: ${code}`);
+        }
       },
+    });
+    this.router = new TelegramRouter(resources.store, config, {
+      readyAtSec: () => this.readyAtSec ?? Number.MAX_SAFE_INTEGER,
+      onSkipped: (classification) => {
+        this.logger.warn(`update skipped: ${classification}`);
+      },
+      flowStore: this.flowStore,
     });
   }
 
   start(): void {
-    if (this.started)
+    if (this.started || this.stopping !== null) {
       throw new Error('Controller service has already started.');
+    }
+    this.flowStore.restartTerminateAll();
+    this.readyAtSec = Math.floor(this.now() / 1000) + 1;
     this.started = true;
-    this.loops = [this.pollLoop(), this.runnerLoop(), this.outboxLoop()].map(
-      (loop) =>
-        loop.catch(() => {
-          this.failController('service loop error');
-        }),
-    );
+    this.startupTask = this.startAfterReady().catch(() => {
+      if (!signalIsAborted(this.abortController.signal)) {
+        this.failController('FLOW_STORAGE_INVALID');
+      }
+    });
   }
 
   stop(): Promise<void> {
@@ -75,17 +138,50 @@ export class ControllerService {
     return this.stopping;
   }
 
+  private async startAfterReady(): Promise<void> {
+    const signal = this.abortController.signal;
+    const readyAtSec = this.readyAtSec;
+    if (readyAtSec === null) return;
+    while (!signal.aborted) {
+      const remaining = readyAtSec * 1000 - this.now();
+      if (remaining <= 0) break;
+      await this.sleep(remaining, signal);
+    }
+    if (signalIsAborted(signal)) return;
+
+    this.resources.store.transaction(() => {
+      this.resources.store.reply(this.allowedUserId, READY_NOTICE);
+    });
+    if (signalIsAborted(signal)) return;
+    this.loops = [this.pollLoop(), this.runnerLoop(), this.outboxLoop()].map(
+      (loop) =>
+        loop.catch(() => {
+          if (!signalIsAborted(signal))
+            this.failController('FLOW_STORAGE_INVALID');
+        }),
+    );
+  }
+
   private async stopInternal(): Promise<void> {
     this.abortController.abort();
-    await this.runner.stop();
+    const runnerStop = this.runner.stop().then(
+      (): { readonly ok: true } => ({ ok: true }),
+      (error: unknown): { readonly ok: false; readonly error: unknown } => ({
+        ok: false,
+        error,
+      }),
+    );
+    await this.startupTask;
     await Promise.all(this.loops);
+    const result = await runnerStop;
     await this.resources.close();
+    if (!result.ok) throw result.error;
   }
 
   private async pollLoop(): Promise<void> {
     let attempts = 0;
     const signal = this.abortController.signal;
-    while (!isSignalAborted(signal)) {
+    while (!signal.aborted) {
       try {
         const updates = await this.telegram.getUpdates(
           this.resources.store.getOffset(),
@@ -94,13 +190,13 @@ export class ControllerService {
         for (const update of [...updates].sort(
           (left, right) => left.update_id - right.update_id,
         )) {
-          if (isSignalAborted(signal)) return;
+          if (signalIsAborted(signal)) return;
           this.router.handle(update);
         }
         if (updates.length === 0) await this.sleep(this.pollIntervalMs, signal);
         attempts = 0;
       } catch (error) {
-        if (isSignalAborted(signal) || isAborted(error)) return;
+        if (signalIsAborted(signal) || isAborted(error)) return;
         if (isFatalTelegram(error)) {
           this.failController(error.kind);
           return;
@@ -115,14 +211,19 @@ export class ControllerService {
   private async runnerLoop(): Promise<void> {
     let attempts = 0;
     const signal = this.abortController.signal;
-    while (!isSignalAborted(signal)) {
+    while (!signal.aborted) {
       try {
         this.runner.tick();
         attempts = 0;
         await this.sleep(100, signal);
       } catch (error) {
-        if (isSignalAborted(signal) || isAborted(error)) return;
-        this.logger.warn('runner storage retry');
+        if (signalIsAborted(signal) || isAborted(error)) return;
+        const code = safeClassification(error);
+        if (ORCHESTRATION_FAILURES.has(code)) {
+          this.failController(code);
+          return;
+        }
+        this.logger.warn(`runner retry: ${code}`);
         await this.backoff(attempts, error, signal);
         attempts += 1;
       }
@@ -132,7 +233,7 @@ export class ControllerService {
   private async outboxLoop(): Promise<void> {
     let attempts = 0;
     const signal = this.abortController.signal;
-    while (!isSignalAborted(signal)) {
+    while (!signal.aborted) {
       try {
         const due = this.resources.store.dueOutbox(this.now());
         if (due.length === 0) {
@@ -140,8 +241,11 @@ export class ControllerService {
           attempts = 0;
           continue;
         }
+        let sendableItems = 0;
         for (const item of due) {
-          if (isSignalAborted(signal)) return;
+          if (signalIsAborted(signal)) return;
+          if (!this.resources.store.isOutboxSendable(item.id)) continue;
+          sendableItems += 1;
           try {
             const sent = await this.telegram.sendMessage(
               item.chatId,
@@ -155,7 +259,7 @@ export class ControllerService {
               this.now(),
             );
           } catch (error) {
-            if (isSignalAborted(signal) || isAborted(error)) return;
+            if (signalIsAborted(signal) || isAborted(error)) return;
             if (isFatalTelegram(error)) {
               this.failController(error.kind);
               return;
@@ -177,11 +281,13 @@ export class ControllerService {
           }
         }
         attempts = 0;
+        if (sendableItems === 0) {
+          await this.sleep(this.outboxIntervalMs, signal);
+        }
       } catch {
-        if (isSignalAborted(signal)) return;
-        this.logger.warn('outbox storage retry');
-        await this.backoff(attempts, undefined, signal);
-        attempts += 1;
+        if (signalIsAborted(signal)) return;
+        this.failController('FLOW_STORAGE_INVALID');
+        return;
       }
     }
   }
@@ -191,7 +297,7 @@ export class ControllerService {
     error: unknown,
     signal: AbortSignal,
   ): Promise<void> {
-    if (isSignalAborted(signal)) return;
+    if (signal.aborted) return;
     const milliseconds = retryDelay(attempts, error);
     try {
       await this.sleep(milliseconds, signal);
@@ -236,6 +342,21 @@ function classification(error: unknown): string {
   return error instanceof TelegramError ? error.kind : 'storage';
 }
 
+function safeClassification(error: unknown): string {
+  if (typeof error !== 'object' || error === null) {
+    return 'FLOW_EXECUTION_FAILED';
+  }
+  const candidates: string[] = [];
+  if ('code' in error && typeof error.code === 'string') {
+    candidates.push(error.code);
+  }
+  if (error instanceof Error) candidates.push(error.message);
+  return (
+    candidates.find((candidate) => ORCHESTRATION_FAILURES.has(candidate)) ??
+    'FLOW_EXECUTION_FAILED'
+  );
+}
+
 function isFatalTelegram(error: unknown): error is TelegramError {
   return (
     error instanceof TelegramError &&
@@ -243,12 +364,12 @@ function isFatalTelegram(error: unknown): error is TelegramError {
   );
 }
 
-function isSignalAborted(signal: AbortSignal): boolean {
-  return signal.aborted;
-}
-
 function isAborted(error: unknown): boolean {
   return error instanceof TelegramError && error.kind === 'aborted';
+}
+
+function signalIsAborted(signal: AbortSignal): boolean {
+  return signal.aborted;
 }
 
 async function abortableSleep(

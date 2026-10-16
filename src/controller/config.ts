@@ -21,7 +21,23 @@ export function parseControllerConfig(
   }
 
   const botMode = tokenSet && userSet;
+  let flowConfigPath = '';
+  let piAuthFile: string | undefined;
   if (botMode) {
+    const flowConfigValue = env['PI_FLOW_CONFIG'];
+    if (flowConfigValue === undefined || flowConfigValue.trim().length === 0) {
+      throw new Error('PI_FLOW_CONFIG is required in bot mode');
+    }
+    flowConfigPath = isAbsolute(flowConfigValue)
+      ? flowConfigValue
+      : resolve(cwd, flowConfigValue);
+    const piAuthFileValue = env['PI_FLOW_AUTH_FILE'];
+    if (piAuthFileValue !== undefined) {
+      if (piAuthFileValue.trim().length === 0) {
+        throw new Error('PI_FLOW_AUTH_FILE must not be empty in bot mode');
+      }
+      piAuthFile = resolve(cwd, piAuthFileValue);
+    }
     if (!/^\d{5,}:[A-Za-z0-9_-]{20,}$/.test(tokenValue)) {
       throw new Error('TELEGRAM_BOT_TOKEN has an invalid format');
     }
@@ -65,6 +81,8 @@ export function parseControllerConfig(
       mode: 'bot',
       token: tokenValue,
       allowedUserId: String(Number(userValue)),
+      flowConfigPath,
+      ...(piAuthFile === undefined ? {} : { piAuthFile }),
     };
   }
   return { ...common, mode: 'health' };

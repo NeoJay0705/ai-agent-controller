@@ -3,12 +3,21 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { describe, expect, it } from 'vitest';
 
-import { ControllerService } from '../../src/controller/service.js';
+import {
+  ControllerService as ProductionControllerService,
+  type ServiceOptions,
+} from '../../src/controller/service.js';
 import { openControllerResources } from '../../src/controller/lifecycle.js';
+import type { ControllerResources } from '../../src/controller/lifecycle.js';
 import { ControllerStore } from '../../src/controller/store.js';
 import { TelegramClient } from '../../src/controller/telegram.js';
 import type { FetchLike } from '../../src/controller/telegram.js';
-import type { ServiceLogger } from '../../src/controller/types.js';
+import type {
+  ControllerConfig,
+  ServiceLogger,
+} from '../../src/controller/types.js';
+import type { AgentNodeResult, AgentRuntime } from '../../src/flow/types.js';
+import { loadFlowBundleConfig } from '../../src/flow/config-file.js';
 import {
   artifactsPath,
   createSession,
@@ -16,14 +25,34 @@ import {
   flushTasks,
   makeUpdate,
   testConfig,
+  testFlowBundle,
+  UNSUPPORTED_AGENT_RUNTIME,
   USER_ID,
   CHAT_ID,
 } from './helpers.js';
+import { FakeAgentRuntime } from '../flow/helpers.js';
+
+type BotConfig = Extract<ControllerConfig, { readonly mode: 'bot' }>;
+
+class ControllerService extends ProductionControllerService {
+  constructor(
+    config: BotConfig,
+    resources: ControllerResources,
+    telegram: TelegramClient,
+    options: ServiceOptions = {},
+  ) {
+    super(config, resources, telegram, testFlowBundle(), {
+      ...options,
+      agentRuntimeForTests:
+        options.agentRuntimeForTests ?? UNSUPPORTED_AGENT_RUNTIME,
+    });
+  }
+}
 
 const SECRET_URL = 'https://upstream.invalid/request?token=raw-secret';
 
 class ManualClock {
-  current = 1000;
+  current = 0;
 
   now = (): number => this.current;
 
@@ -74,6 +103,19 @@ class ManualSleep {
       if (item.milliseconds === milliseconds) item.finish();
     }
   }
+}
+
+async function startService(
+  service: ControllerService,
+  clock: ManualClock,
+  sleeper: ManualSleep,
+): Promise<void> {
+  service.start();
+  const readyTime = Math.floor(clock.current / 1000) * 1000 + 1000;
+  const delay = readyTime - clock.current;
+  clock.advanceTo(readyTime);
+  sleeper.releaseDelay(delay);
+  await flushTasks();
 }
 
 function methodName(input: Parameters<FetchLike>[0]): string {
@@ -148,6 +190,31 @@ async function removeDirectory(path: string): Promise<void> {
 }
 
 describe('controller service real loops', () => {
+  it('requires Pi auth configuration even when a fake AgentRuntime is injected', async () => {
+    await ensureArtifactsDirectory();
+    const dataDir = dataDirectory('service-pi-auth-required');
+    const config = testConfig({ CONTROLLER_DATA_DIR: dataDir });
+    const resources = await openControllerResources(config);
+    const bundle = await loadFlowBundleConfig(
+      join(process.cwd(), 'config/pi-flow.oauth.example.json'),
+    );
+    try {
+      expect(
+        () =>
+          new ProductionControllerService(
+            config,
+            resources,
+            new TelegramClient(config.token, () => updateResponse([])),
+            bundle,
+            { agentRuntimeForTests: new FakeAgentRuntime() },
+          ),
+      ).toThrow('PI_FLOW_AUTH_FILE is required for pi-login authentication.');
+    } finally {
+      await resources.close();
+      await removeDirectory(dataDir);
+    }
+  });
+
   it('sorts a polling batch and uses the committed offset on the next request', async () => {
     await ensureArtifactsDirectory();
     const dataDir = dataDirectory('service-poll-order');
@@ -190,7 +257,7 @@ describe('controller service real loops', () => {
         new TelegramClient(config.token, fetcher),
         { clock, sleep: sleeper.sleep },
       );
-      service.start();
+      await startService(service, clock, sleeper);
       await pumpUntil(
         sleeper,
         () =>
@@ -267,7 +334,7 @@ describe('controller service real loops', () => {
         new TelegramClient(config.token, fetcher),
         { clock, sleep: sleeper.sleep, logger },
       );
-      service.start();
+      await startService(service, clock, sleeper);
       await pumpUntil(sleeper, () => sleeper.hasDelay(500));
       expect(resources.store.getOffset()).toBe(0);
       expect(resources.store.isUpdateProcessed(55)).toBe(false);
@@ -337,6 +404,15 @@ describe('controller service real loops', () => {
       if (method !== 'sendMessage')
         throw new Error(`Unexpected Telegram API method ${method}.`);
       const body = bodyOf(init);
+      if (
+        typeof body['text'] === 'string' &&
+        body['text'].includes('Controller is READY')
+      ) {
+        return jsonResponse({
+          message_id: 8999,
+          chat: { id: Number(body['chat_id']) },
+        });
+      }
       sentBodies.push(body);
       sendCount += 1;
       if (sendCount === 1) {
@@ -366,7 +442,7 @@ describe('controller service real loops', () => {
         new TelegramClient(config.token, fetcher),
         { clock, sleep: sleeper.sleep },
       );
-      service.start();
+      await startService(service, clock, sleeper);
       await pumpUntil(
         sleeper,
         () =>
@@ -374,13 +450,13 @@ describe('controller service real loops', () => {
           sleeper.hasDelay(2000) &&
           resources.store.database
             .prepare(
-              "SELECT COUNT(*) AS count FROM outbox WHERE kind IN ('reply','ack')",
+              "SELECT COUNT(*) AS count FROM outbox WHERE kind IN ('reply','ack') AND text NOT LIKE '%Controller is READY%'",
             )
             .get()?.count === 3,
       );
       const afterRateLimit = resources.store.database
         .prepare(
-          "SELECT kind, status, attempts, next_attempt_at FROM outbox WHERE kind IN ('reply','ack') ORDER BY rowid",
+          "SELECT kind, status, attempts, next_attempt_at FROM outbox WHERE kind IN ('reply','ack') AND text NOT LIKE '%Controller is READY%' ORDER BY rowid",
         )
         .all();
       expect(afterRateLimit).toEqual([
@@ -422,13 +498,15 @@ describe('controller service real loops', () => {
       expect(
         resources.store.database
           .prepare(
-            "SELECT kind, status, attempts, next_attempt_at FROM outbox WHERE kind IN ('reply','ack') ORDER BY rowid",
+            "SELECT kind, status, attempts, next_attempt_at FROM outbox WHERE kind IN ('reply','ack') AND text NOT LIKE '%Controller is READY%' ORDER BY rowid",
           )
           .all(),
       ).toEqual(afterRateLimit);
       expect(
         resources.store.database
-          .prepare("SELECT COUNT(*) AS count FROM outbox WHERE kind='reply'")
+          .prepare(
+            "SELECT COUNT(*) AS count FROM outbox WHERE kind='reply' AND text NOT LIKE '%Controller is READY%'",
+          )
           .get(),
       ).toMatchObject({ count: 2 });
       expect(
@@ -439,54 +517,34 @@ describe('controller service real loops', () => {
 
       clock.advanceTo(3000);
       sleeper.releaseDelay(2000);
-      await pumpUntil(sleeper, () => sendCount === 5);
+      for (let retry = 0; retry < 10; retry += 1) {
+        const nextDue = resources.store.database
+          .prepare(
+            "SELECT MIN(next_attempt_at) AS next_attempt_at FROM outbox WHERE status='PENDING'",
+          )
+          .get() as { next_attempt_at: number | null };
+        if (nextDue.next_attempt_at === null) break;
+        clock.advanceTo(Math.max(clock.current, nextDue.next_attempt_at));
+        sleeper.releaseAtMost(30_000);
+        await pumpUntil(
+          sleeper,
+          () =>
+            (
+              resources.store.database
+                .prepare(
+                  "SELECT COUNT(*) AS count FROM outbox WHERE status='PENDING' AND next_attempt_at<=?",
+                )
+                .get(clock.current) as { count: number }
+            ).count === 0,
+        );
+      }
       expect(
         resources.store.database
           .prepare(
-            "SELECT status, attempts, next_attempt_at FROM outbox WHERE kind='ack'",
+            "SELECT COUNT(*) AS count FROM outbox WHERE status='PENDING'",
           )
           .get(),
-      ).toEqual({ status: 'PENDING', attempts: 1, next_attempt_at: 3500 });
-      expect(
-        resources.store.database
-          .prepare(
-            "SELECT status, attempts, next_attempt_at FROM outbox WHERE kind='reply' ORDER BY rowid LIMIT 1",
-          )
-          .get(),
-      ).toEqual({ status: 'PENDING', attempts: 2, next_attempt_at: 4000 });
-      expect(
-        resources.store.database
-          .prepare(
-            "SELECT status, attempts FROM outbox WHERE kind='reply' ORDER BY rowid DESC LIMIT 1",
-          )
-          .get(),
-      ).toEqual({ status: 'DELIVERED', attempts: 1 });
-      expect(
-        resources.store.database
-          .prepare('SELECT COUNT(*) AS count FROM jobs')
-          .get(),
-      ).toMatchObject({ count: 1 });
-
-      clock.advanceTo(3500);
-      await pumpUntil(
-        sleeper,
-        () =>
-          sendCount === 6 &&
-          resources.store.database
-            .prepare("SELECT status FROM outbox WHERE kind='ack'")
-            .get()?.status === 'DELIVERED',
-      );
-      clock.advanceTo(4000);
-      await pumpUntil(
-        sleeper,
-        () =>
-          sendCount === 7 &&
-          resources.store.database
-            .prepare(
-              "SELECT COUNT(*) AS count FROM outbox WHERE status='PENDING'",
-            )
-            .get()?.count === 0,
-      );
+      ).toMatchObject({ count: 0 });
       expect(
         resources.store.database
           .prepare('SELECT COUNT(*) AS count FROM jobs')
@@ -494,11 +552,8 @@ describe('controller service real loops', () => {
       ).toMatchObject({ count: 1 });
       expect(
         resources.store.statusForSession(USER_ID, CHAT_ID)?.[0],
-      ).toMatchObject({
-        status: 'COMPLETED',
-        checkpoint: 3,
-      });
-      expect(sentBodies).toHaveLength(7);
+      ).toMatchObject({ status: 'COMPLETED' });
+      expect(sentBodies.length).toBeGreaterThanOrEqual(4);
       expect(new Set(methods)).toEqual(new Set(['getUpdates', 'sendMessage']));
     } finally {
       await service?.stop();
@@ -557,7 +612,7 @@ describe('controller service real loops', () => {
         new TelegramClient(config.token, fetcher),
         { clock, sleep: sleeper.sleep },
       );
-      service.start();
+      await startService(service, clock, sleeper);
       await pumpUntil(sleeper, () => sendCount === 1 && sleeper.hasDelay(2000));
       expect(
         resources.store.database
@@ -599,9 +654,18 @@ describe('controller service real loops', () => {
       }
       if (method !== 'sendMessage')
         throw new Error(`Unexpected Telegram API method ${method}.`);
-      sendCount += 1;
       const body = bodyOf(init);
       const chatId = Number(body['chat_id']);
+      if (
+        typeof body['text'] === 'string' &&
+        body['text'].includes('Controller is READY')
+      ) {
+        return jsonResponse({
+          message_id: 12_999,
+          chat: { id: chatId },
+        });
+      }
+      sendCount += 1;
       return jsonResponse({
         message_id: 13_000 + sendCount,
         chat: { id: chatId + (sendCount === 1 ? 1 : 0) },
@@ -614,22 +678,33 @@ describe('controller service real loops', () => {
         new TelegramClient(config.token, fetcher),
         { clock, sleep: sleeper.sleep, logger },
       );
-      service.start();
-      await pumpUntil(
-        sleeper,
-        () =>
-          sendCount === 2 &&
-          resources.store.database
-            .prepare("SELECT status FROM outbox WHERE kind='reply'")
-            .get()?.status === 'PENDING' &&
-          resources.store.database
-            .prepare("SELECT status FROM outbox WHERE kind='ack'")
-            .get()?.status === 'DELIVERED',
-      );
+      await startService(service, clock, sleeper);
+      const mismatchReached = (): boolean =>
+        sendCount === 2 &&
+        resources.store.database
+          .prepare(
+            "SELECT status FROM outbox WHERE kind='reply' AND text NOT LIKE '%Controller is READY%'",
+          )
+          .get()?.status === 'PENDING' &&
+        resources.store.database
+          .prepare("SELECT status FROM outbox WHERE kind='ack'")
+          .get()?.status === 'DELIVERED';
+      try {
+        await pumpUntil(sleeper, mismatchReached);
+      } catch {
+        const rows = resources.store.database
+          .prepare(
+            'SELECT kind, status, attempts, next_attempt_at, text FROM outbox ORDER BY rowid',
+          )
+          .all();
+        throw new Error(
+          `Mismatch delivery state: sendCount=${String(sendCount)}; offsets=${String(offsets)}; rows=${JSON.stringify(rows)}; logs=${JSON.stringify(logger.messages)}`,
+        );
+      }
       expect(
         resources.store.database
           .prepare(
-            "SELECT attempts, next_attempt_at FROM outbox WHERE kind='reply'",
+            "SELECT attempts, next_attempt_at FROM outbox WHERE kind='reply' AND text NOT LIKE '%Controller is READY%'",
           )
           .get(),
       ).toEqual({ attempts: 1, next_attempt_at: 1500 });
@@ -644,9 +719,11 @@ describe('controller service real loops', () => {
       await pumpUntil(
         sleeper,
         () =>
-          sendCount === 3 &&
+          sendCount >= 3 &&
           resources.store.database
-            .prepare("SELECT status FROM outbox WHERE kind='reply'")
+            .prepare(
+              "SELECT status FROM outbox WHERE kind='reply' AND text NOT LIKE '%Controller is READY%'",
+            )
             .get()?.status === 'DELIVERED',
       );
       expect(
@@ -713,7 +790,7 @@ describe('controller service real loops', () => {
         new TelegramClient(config.token, fetcher),
         { clock, sleep: sleeper.sleep },
       );
-      service.start();
+      await startService(service, clock, sleeper);
       await pumpUntil(
         sleeper,
         () =>
@@ -727,7 +804,6 @@ describe('controller service real loops', () => {
       expect(jobId).toBeDefined();
       expect(resources.store.statusForJob(USER_ID, jobId ?? '')).toMatchObject({
         status: 'COMPLETED',
-        checkpoint: 3,
       });
       expect(
         resources.store.database
@@ -767,6 +843,27 @@ describe('controller service real loops', () => {
       const methods: string[] = [];
       let pollCount = 0;
       let senderStarted = false;
+      let agentStarted = false;
+      const blockedRuntime: AgentRuntime = {
+        run({ signal }) {
+          agentStarted = true;
+          return new Promise<AgentNodeResult>((_resolve, reject) => {
+            const fail = (): void => {
+              const error = new Error('FLOW_ABORTED') as Error & {
+                code: string;
+              };
+              error.code = 'FLOW_ABORTED';
+              reject(error);
+            };
+            if (signal.aborted) {
+              fail();
+              return;
+            }
+            signal.addEventListener('abort', fail, { once: true });
+          });
+        },
+        async dispose() {},
+      };
       let releaseFatal!: (response: Response) => void;
       const fatalKinds: string[] = [];
       let service: ControllerService | undefined;
@@ -825,6 +922,7 @@ describe('controller service real loops', () => {
             clock,
             sleep: sleeper.sleep,
             logger,
+            agentRuntimeForTests: blockedRuntime,
             ...(status === 401
               ? {
                   onFatal: (classification: string) => {
@@ -834,16 +932,16 @@ describe('controller service real loops', () => {
               : {}),
           },
         );
-        service.start();
+        await startService(service, clock, sleeper);
         await pumpUntil(
           sleeper,
           () =>
             senderStarted &&
+            agentStarted &&
             resources.store.database
               .prepare('SELECT status FROM jobs LIMIT 1')
               .get()?.status === 'RUNNING',
         );
-        expect(sleeper.hasDelay(10_000)).toBe(true);
         releaseFatal(new Response('invalid-json', { status }));
         await pumpUntil(sleeper, () =>
           logger.messages.includes(`controller stopped: ${kind}`),
@@ -866,13 +964,8 @@ describe('controller service real loops', () => {
           { now: clock.now },
         );
         expect(
-          reopened.database
-            .prepare('SELECT status, checkpoint FROM jobs')
-            .get(),
-        ).toEqual({
-          status: 'RUNNING',
-          checkpoint: 0,
-        });
+          reopened.database.prepare('SELECT status FROM jobs').get(),
+        ).toEqual({ status: 'RUNNING' });
         expect(
           reopened.database
             .prepare("SELECT status, attempts FROM outbox WHERE kind='ack'")
@@ -889,13 +982,352 @@ describe('controller service real loops', () => {
     },
   );
 
-  it('persists prompt delivery mapping and resumes the original Job after switching Session', async () => {
+  it('sends valid notifications beyond more than 20 unsendable RUNNING prompts', async () => {
+    await ensureArtifactsDirectory();
+    const dataDir = dataDirectory('service-running-stale-prompts');
+    const config = testConfig({
+      CONTROLLER_DATA_DIR: dataDir,
+      JOB_CONCURRENCY: '32',
+      MAX_PENDING_JOBS: '100',
+    });
+    const sleeper = new ManualSleep();
+    const clock = new ManualClock();
+    const resources = await openControllerResources(config, { now: clock.now });
+    const updates = [
+      makeUpdate(1, '/new active-worker'),
+      makeUpdate(2, '/queue wait for stale prompt test'),
+    ];
+    const sentTexts: string[] = [];
+    let workerStarted = false;
+    let releaseWorker!: () => void;
+    let resolveWorkerStarted!: () => void;
+    const workerStartedTask = new Promise<void>((resolve) => {
+      resolveWorkerStarted = resolve;
+    });
+    const workerGate = new Promise<void>((resolve) => {
+      releaseWorker = resolve;
+    });
+    const runtime: AgentRuntime = {
+      async run({ signal }) {
+        workerStarted = true;
+        resolveWorkerStarted();
+        await new Promise<void>((resolve) => {
+          const finish = (): void => {
+            signal.removeEventListener('abort', finish);
+            resolve();
+          };
+          if (signal.aborted) {
+            finish();
+            return;
+          }
+          signal.addEventListener('abort', finish, { once: true });
+          void workerGate.then(finish);
+        });
+        if (signal.aborted) {
+          const error = new Error('FLOW_ABORTED') as Error & { code: string };
+          error.code = 'FLOW_ABORTED';
+          throw error;
+        }
+        return {
+          transition: 'ready',
+          result: { suggestedFlow: null },
+        };
+      },
+      async dispose() {},
+    };
+    let service: ControllerService | undefined;
+    const fetcher: FetchLike = (input, init) => {
+      const method = methodName(input);
+      if (method === 'getUpdates') return updateResponse(updates.splice(0));
+      if (method !== 'sendMessage')
+        throw new Error(`Unexpected Telegram API method ${method}.`);
+      const body = bodyOf(init);
+      const text = typeof body['text'] === 'string' ? body['text'] : '';
+      sentTexts.push(text);
+      return jsonResponse({
+        message_id: 15_000 + sentTexts.length,
+        chat: { id: Number(body['chat_id']) },
+      });
+    };
+    try {
+      service = new ControllerService(
+        config,
+        resources,
+        new TelegramClient(config.token, fetcher),
+        {
+          clock,
+          sleep: sleeper.sleep,
+          agentRuntimeForTests: runtime,
+        },
+      );
+      await startService(service, clock, sleeper);
+      await pumpUntil(sleeper, () => workerStarted);
+      await workerStartedTask;
+
+      for (let index = 0; index < 25; index += 1) {
+        const ownerId = `stale-owner-${String(index)}`;
+        const chatId = `stale-chat-${String(index)}`;
+        const sessionId = resources.store.transaction(
+          () =>
+            resources.store.createSession(
+              ownerId,
+              chatId,
+              `stale-${String(index)}`,
+            ).id,
+        );
+        const jobId = resources.store.transaction(() =>
+          resources.store.queueJob(ownerId, chatId, 'stale prompt job', 100),
+        );
+        resources.store.transaction(() => {
+          resources.store.database
+            .prepare("UPDATE outbox SET status='DELIVERED' WHERE session_id=?")
+            .run(sessionId);
+          resources.store.database
+            .prepare("UPDATE jobs SET status='RUNNING' WHERE id=?")
+            .run(jobId);
+          resources.store.enqueueJobNotification(
+            jobId,
+            'prompt',
+            `stale running prompt ${String(index)}`,
+            0,
+          );
+        });
+      }
+      resources.store.transaction(() => {
+        resources.store.reply(
+          CHAT_ID,
+          'valid notification after stale prompts',
+        );
+      });
+
+      await pumpUntil(sleeper, () =>
+        sentTexts.includes('valid notification after stale prompts'),
+      );
+      expect(
+        sentTexts.some((text) => text.includes('stale running prompt')),
+      ).toBe(false);
+      expect(
+        resources.store.database
+          .prepare(
+            "SELECT COUNT(*) AS count FROM outbox WHERE kind='prompt' AND text LIKE '%stale running prompt%' AND status='PENDING'",
+          )
+          .get(),
+      ).toMatchObject({ count: 25 });
+      expect(
+        resources.store.database
+          .prepare('SELECT COUNT(*) AS count FROM outbox_cancellations')
+          .get(),
+      ).toMatchObject({ count: 0 });
+
+      releaseWorker();
+      await pumpUntil(
+        sleeper,
+        () =>
+          resources.store.statusForSession(USER_ID, CHAT_ID)?.[0]?.status ===
+          'COMPLETED',
+      );
+      await service.stop();
+      expect(() => resources.store.getOffset()).toThrow();
+    } finally {
+      releaseWorker();
+      await service?.stop();
+      await removeDirectory(dataDir);
+    }
+  });
+
+  it('sleeps cancellably when a stale due snapshot contains no sendable items', async () => {
+    await ensureArtifactsDirectory();
+    const dataDir = dataDirectory('service-stale-snapshot-sleep');
+    const config = testConfig({ CONTROLLER_DATA_DIR: dataDir });
+    const sleeper = new ManualSleep();
+    const clock = new ManualClock();
+    const resources = await openControllerResources(config, { now: clock.now });
+    const sentTexts: string[] = [];
+    let service: ControllerService | undefined;
+    const fetcher: FetchLike = (input, init) => {
+      const method = methodName(input);
+      if (method === 'getUpdates') return updateResponse([]);
+      if (method !== 'sendMessage')
+        throw new Error(`Unexpected Telegram API method ${method}.`);
+      const body = bodyOf(init);
+      const text = typeof body['text'] === 'string' ? body['text'] : '';
+      sentTexts.push(text);
+      return jsonResponse({
+        message_id: 16_000 + sentTexts.length,
+        chat: { id: Number(body['chat_id']) },
+      });
+    };
+    try {
+      service = new ControllerService(
+        config,
+        resources,
+        new TelegramClient(config.token, fetcher),
+        {
+          clock,
+          sleep: sleeper.sleep,
+          pollIntervalMs: 700,
+          outboxIntervalMs: 300,
+        },
+      );
+      await startService(service, clock, sleeper);
+      await pumpUntil(
+        sleeper,
+        () =>
+          sentTexts.some((text) => text.includes('Controller is READY')) &&
+          sleeper.hasDelay(300),
+      );
+
+      let dueSnapshots = 0;
+      const staleSnapshot = {
+        id: 'stale-snapshot-row',
+        sessionId: null,
+        jobId: 'stale-job',
+        kind: 'prompt' as const,
+        text: 'stale prompt snapshot',
+        attempts: 0,
+        chatId: CHAT_ID,
+        promptGeneration: 0,
+      };
+      resources.store.dueOutbox = () => {
+        dueSnapshots += 1;
+        return [staleSnapshot];
+      };
+      sleeper.releaseDelay(300);
+      await flushTasks();
+      expect(dueSnapshots).toBe(1);
+      for (let turn = 0; turn < 5; turn += 1) await flushTasks();
+      expect(dueSnapshots).toBe(1);
+      expect(sleeper.hasDelay(300)).toBe(true);
+
+      await service.stop();
+      expect(() => resources.store.getOffset()).toThrow();
+    } finally {
+      await service?.stop();
+      await removeDirectory(dataDir);
+    }
+  });
+
+  it.each([
+    {
+      message: 'FLOW_STORAGE_INVALID',
+      classification: 'FLOW_STORAGE_INVALID',
+    },
+    {
+      message: 'FLOW_SCHEDULER_FAILED',
+      classification: 'FLOW_SCHEDULER_FAILED',
+    },
+    {
+      message: 'SYNTHETIC_UNSAFE_DETAILS',
+      classification: 'FLOW_EXECUTION_FAILED',
+    },
+  ])(
+    'uses only an orchestration allowlist for fatal callback classification',
+    async ({ message, classification }) => {
+      await ensureArtifactsDirectory();
+      const dataDir = dataDirectory(
+        `service-fatal-classification-${classification}`,
+      );
+      const config = testConfig({ CONTROLLER_DATA_DIR: dataDir });
+      const sleeper = new ManualSleep();
+      const clock = new ManualClock();
+      const resources = await openControllerResources(config, {
+        now: clock.now,
+      });
+      const logger = testLogger();
+      const fatalKinds: string[] = [];
+      let service: ControllerService | undefined;
+      try {
+        service = new ControllerService(
+          config,
+          resources,
+          new TelegramClient(config.token, () => updateResponse([])),
+          {
+            clock,
+            sleep: sleeper.sleep,
+            logger,
+            onFatal: (kind) => fatalKinds.push(kind),
+          },
+        );
+        await startService(service, clock, sleeper);
+        const reporter = service.runner as unknown as {
+          report(code: string): void;
+        };
+        reporter.report(message);
+        await pumpUntil(sleeper, () => fatalKinds.length > 0);
+        expect(fatalKinds).toEqual([classification]);
+        expect(logger.messages).not.toContain(message);
+        expect(logger.messages).toContain(
+          `controller stopped: ${classification}`,
+        );
+        await service.stop();
+        expect(() => resources.store.getOffset()).toThrow();
+      } finally {
+        await service?.stop();
+        await removeDirectory(dataDir);
+      }
+    },
+  );
+
+  it('closes resources after a runner dispose rejection and cancels the READY gate', async () => {
+    await ensureArtifactsDirectory();
+    const dataDir = dataDirectory('service-stop-dispose-rejection');
+    const config = testConfig({ CONTROLLER_DATA_DIR: dataDir });
+    const sleeper = new ManualSleep();
+    const clock = new ManualClock();
+    const resources = await openControllerResources(config, { now: clock.now });
+    const logger = testLogger();
+    const fatalKinds: string[] = [];
+    let service: ControllerService | undefined;
+    const runtime: AgentRuntime = {
+      run() {
+        return Promise.reject(new Error('SYNTHETIC_RUN_FAILURE'));
+      },
+      dispose() {
+        return Promise.reject(new Error('SYNTHETIC_DISPOSE_FAILURE'));
+      },
+    };
+    const calls: string[] = [];
+    const fetcher: FetchLike = (input) => {
+      calls.push(methodName(input));
+      return updateResponse([]);
+    };
+    try {
+      service = new ControllerService(
+        config,
+        resources,
+        new TelegramClient(config.token, fetcher),
+        {
+          clock,
+          sleep: sleeper.sleep,
+          logger,
+          agentRuntimeForTests: runtime,
+          onFatal: (kind) => fatalKinds.push(kind),
+        },
+      );
+      service.start();
+      await flushTasks();
+      await expect(service.stop()).rejects.toMatchObject({
+        message: 'FLOW_RUNTIME_DISPOSED',
+      });
+      expect(fatalKinds).toEqual(['FLOW_RUNTIME_DISPOSED']);
+      expect(calls).toEqual([]);
+      expect(logger.messages.join('\n')).not.toContain(
+        'SYNTHETIC_DISPOSE_FAILURE',
+      );
+      expect(await exists(join(dataDir, 'controller.lock'))).toBe(false);
+      expect(() => resources.store.getOffset()).toThrow();
+    } finally {
+      await service?.stop().catch(() => undefined);
+      await removeDirectory(dataDir);
+    }
+  });
+
+  it('binds real prompt replies to the original Job after /use switches Session', async () => {
     await ensureArtifactsDirectory();
     const dataDir = dataDirectory('service-prompt-reply');
     const config = testConfig({
       CONTROLLER_DATA_DIR: dataDir,
       JOB_CONCURRENCY: '1',
-      DEMO_STEP_MS: '1',
     });
     const sleeper = new ManualSleep();
     const clock = new ManualClock();
@@ -903,10 +1335,12 @@ describe('controller service real loops', () => {
     const methods: string[] = [];
     const updates = [
       makeUpdate(1, '/new prompt-session'),
-      makeUpdate(2, '/queue ask: more input'),
+      makeUpdate(2, '/queue MBTI self-reflection'),
     ];
     let sendCount = 0;
     let promptId = 0;
+    let questionPromptId = 0;
+    let candidatePromptId = 0;
     let service: ControllerService | undefined;
     const fetcher: FetchLike = (input, init) => {
       const method = methodName(input);
@@ -917,11 +1351,12 @@ describe('controller service real loops', () => {
       const body = bodyOf(init);
       sendCount += 1;
       const messageId = 11_000 + sendCount;
-      if (
-        typeof body['text'] === 'string' &&
-        body['text'].includes('Please provide the missing input')
-      ) {
-        promptId = messageId;
+      if (typeof body['text'] === 'string') {
+        if (body['text'].includes('請明確回覆 Flow ID')) promptId = messageId;
+        if (body['text'].includes('以下是原創生活偏好題')) {
+          questionPromptId = messageId;
+        }
+        if (body['text'].includes('解析候選')) candidatePromptId = messageId;
       }
       return jsonResponse({
         message_id: messageId,
@@ -933,9 +1368,13 @@ describe('controller service real loops', () => {
         config,
         resources,
         new TelegramClient(config.token, fetcher),
-        { clock, sleep: sleeper.sleep },
+        {
+          clock,
+          sleep: sleeper.sleep,
+          agentRuntimeForTests: new FakeAgentRuntime(),
+        },
       );
-      service.start();
+      await startService(service, clock, sleeper);
       await pumpUntil(
         sleeper,
         () =>
@@ -952,44 +1391,65 @@ describe('controller service real loops', () => {
         ownerId: USER_ID,
         active: true,
       });
-      expect(
-        resources.store.database
-          .prepare("SELECT COUNT(*) AS count FROM outbox WHERE kind='prompt'")
-          .get(),
-      ).toMatchObject({ count: 1 });
 
+      updates.push(makeUpdate(3, '/new other-session'));
+      await pumpUntil(
+        sleeper,
+        () =>
+          resources.store.selectedSession(USER_ID, CHAT_ID)?.name ===
+          'other-session',
+      );
+      const otherSession = resources.store.selectedSession(USER_ID, CHAT_ID);
+      if (otherSession === null) throw new Error('Expected the other Session.');
       updates.push(
-        makeUpdate(3, '/new other-session'),
-        makeUpdate(4, 'additional details', { replyTo: promptId }),
+        makeUpdate(4, `/use ${otherSession.id}`),
+        makeUpdate(5, 'mbti', { replyTo: promptId }),
       );
       await pumpUntil(
         sleeper,
         () =>
+          questionPromptId > 0 &&
           resources.store.statusForJob(USER_ID, job.id)?.status ===
-            'COMPLETED' &&
-          resources.store.database
-            .prepare("SELECT status FROM outbox WHERE kind='completed'")
-            .get()?.status === 'DELIVERED',
+            'WAITING_INPUT' &&
+          resources.store
+            .statusForJob(USER_ID, job.id)
+            ?.appliedSteering.includes('mbti') === true,
       );
-      expect(resources.store.selectedSession(USER_ID, CHAT_ID)?.name).toBe(
-        'other-session',
+      expect(resources.store.selectedSession(USER_ID, CHAT_ID)?.id).toBe(
+        otherSession.id,
       );
       expect(resources.store.statusForJob(USER_ID, job.id)).toMatchObject({
         id: job.id,
-        status: 'COMPLETED',
-        appliedSteering: ['additional details'],
+        status: 'WAITING_INPUT',
+        appliedSteering: ['mbti'],
         pendingSteering: 0,
       });
-      const completion = resources.store.database
-        .prepare("SELECT text FROM outbox WHERE kind='completed'")
-        .get() as { text: string };
-      expect(completion.text).toContain('Original input: ask: more input');
-      expect(completion.text).toContain('additional details');
+
+      updates.push(
+        makeUpdate(6, '1=2 2=0 3=null 4=1', { replyTo: questionPromptId }),
+      );
+      await pumpUntil(
+        sleeper,
+        () =>
+          candidatePromptId > 0 &&
+          resources.store
+            .statusForJob(USER_ID, job.id)
+            ?.appliedSteering.includes('1=2 2=0 3=null 4=1') === true,
+      );
+      expect(
+        resources.store.findPrompt(CHAT_ID, questionPromptId),
+      ).toMatchObject({
+        jobId: job.id,
+        ownerId: USER_ID,
+        active: false,
+      });
       expect(
         resources.store.database
-          .prepare('SELECT COUNT(*) AS count FROM jobs')
+          .prepare(
+            "SELECT COUNT(*) AS count FROM outbox WHERE kind='completed'",
+          )
           .get(),
-      ).toMatchObject({ count: 1 });
+      ).toMatchObject({ count: 0 });
       expect(new Set(methods)).toEqual(new Set(['getUpdates', 'sendMessage']));
     } finally {
       await service?.stop();

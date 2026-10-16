@@ -192,8 +192,9 @@ QUEUED → RUNNING → COMPLETED
 | `HOST`、`PORT` | 延續既有 health server 設定。 |
 
 - 兩個 Telegram 設定都未設定時，只啟動 health mode；只設定一個或設定無效時，啟動失敗。
-- Bot 模式啟動 scheduler、polling 與 outbox sender。單程序以資料目錄 exclusive lock 防止第二個程序；發現既存 lock 時啟動失敗，不自動判斷或清除 stale lock。
-- Graceful shutdown 停止接收 update、abort fetch 與 sleep、等待 loop 結束、關閉 DB，再釋放 lock。
+- Bot 模式只支援 Linux，且必須有固定路徑 `/usr/bin/flock`（util-linux）。單程序以本機 filesystem 上的 kernel `flock` 防止第二個程序；不支援共享跨主機 data 或 HA。永久 `controller.kernel.lock` anchor 存在不代表鎖正被持有，程式不得移除 anchor。取得 kernel lock 後，可原子回收指向相同 anchor 的有效新版 stale marker。
+- 舊 numeric PID-only、空白、毀損或未知 `controller.lock` marker 一律 fail closed。不得依 PID 是否存在、mtime 或 timeout 自動刪除。只有操作者確認所有 Controller 已停止後，才可一次性移除舊版／未知 marker；不得移除 anchor 或運作中 Controller 的 lock 檔。
+- Graceful shutdown 停止接收 update、abort fetch 與 sleep、等待 loop 結束、關閉 DB，再移除自己擁有的 marker 並釋放 kernel lock；anchor 永久保留。非 Linux 或 flock 缺失／失敗時安全拒絕啟動，不使用 PID-lock fallback。
 - `/health` 是 liveness，不代表 DB、Telegram 或 outbox readiness。
 
 ### TC-REQ-014 — Secret 與 transport 安全
@@ -229,7 +230,7 @@ QUEUED → RUNNING → COMPLETED
 | AT-19 | 相同 `update_id` 重送不重複執行命令；DB 交易失敗時 offset 不前進，成功提交後才使用新 offset。 | TC-REQ-011 |
 | AT-20 | 成功、429、網路／5xx、永久 4xx、Bot blocked、invalid token 與 webhook conflict 依規定分類；永久 delivery failure 不重跑 Job。 | TC-REQ-012 |
 | AT-21 | Outbox 每片不超過 3500 UTF-16 code units，不切開 surrogate pair；已 delivered 項目重啟後不再送。 | TC-REQ-010, 012 |
-| AT-22 | 既存 lock 使第二程序啟動失敗；程式不清 lock；graceful shutdown 依序停止 loop、關閉 DB、釋放 lock。 | TC-REQ-013 |
+| AT-22 | 獨立程序由 kernel lock 互斥；SIGKILL 後同 anchor 的完整新版 marker 可安全回收；legacy PID／unknown marker 保留並 fail closed；正常關閉先關 DB、再移除本身 marker／釋放鎖，永久 anchor 保留。 | TC-REQ-013 |
 | AT-23 | Log 不含 raw token 或含 token 的完整 URL；health 回應只代表 liveness。 | TC-REQ-013, 014 |
 | AT-24 | Demo 不呼叫 LLM、Shell、任意 code、附件或外部業務服務。 | TC-REQ-008 |
 

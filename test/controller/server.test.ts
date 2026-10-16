@@ -1,18 +1,42 @@
-import { access, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { createConnection, createServer, type AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 
 import { startServer, type RunningServer } from '../../src/server.js';
 import type { FetchLike } from '../../src/controller/telegram.js';
 import type { ServiceLogger } from '../../src/controller/types.js';
+import type { ControllerStore } from '../../src/controller/store.js';
+import { MAX_FLOW_CONFIG_BYTES } from '../../src/flow/config.js';
 import {
   artifactsPath,
   flushTasks,
   makeUpdate,
   TEST_TOKEN,
   USER_ID,
+  UNSUPPORTED_AGENT_RUNTIME,
 } from './helpers.js';
+
+const FLOW_CONFIG_PATH = resolve(process.cwd(), 'config/pi-flow.example.json');
+const OAUTH_CONFIG_PATH = resolve(
+  process.cwd(),
+  'config/pi-flow.oauth.example.json',
+);
+const CONFIG_FIXTURE_DIR = resolve(
+  process.cwd(),
+  '.test-artifacts/pi-flow/server-config',
+);
+
+async function ensureConfigFixtureDirectory(): Promise<void> {
+  await mkdir(CONFIG_FIXTURE_DIR, { recursive: true, mode: 0o700 });
+}
+
+function openReadyGate(clock: ManualClock, sleeper: ManualSleep): void {
+  const readyTime = Math.floor(clock.current / 1000) * 1000 + 1000;
+  const delay = readyTime - clock.current;
+  clock.current = readyTime;
+  sleeper.releaseAtMost(delay);
+}
 
 const SECRET_URL = 'https://upstream.invalid/request?token=raw-secret';
 
@@ -145,16 +169,12 @@ async function pumpUntil(
     throw new Error('Server service condition was not reached.');
 }
 
-function serviceStore(server: RunningServer) {
+function serviceStore(server: RunningServer): ControllerStore {
   if (server.service === undefined)
     throw new Error('Bot mode service is required.');
   return (
     server.service as unknown as {
-      readonly resources: {
-        readonly store: {
-          getOffset(): number;
-        };
-      };
+      readonly resources: { readonly store: ControllerStore };
     }
   ).resources.store;
 }
@@ -165,13 +185,24 @@ describe('HTTP server and controller wiring', () => {
     const port = await availablePort();
     let fetchCalls = 0;
     let server: RunningServer | undefined;
+    const healthEnvironment: Record<string, string | undefined> = {
+      HOST: '127.0.0.1',
+      PORT: String(port),
+      CONTROLLER_DATA_DIR: dataPath,
+    };
+    Object.defineProperty(healthEnvironment, 'PI_FLOW_CONFIG', {
+      get() {
+        throw new Error('health mode must not read Flow config');
+      },
+    });
+    Object.defineProperty(healthEnvironment, 'PI_FLOW_AUTH_FILE', {
+      get() {
+        throw new Error('health mode must not read Pi auth source');
+      },
+    });
     try {
       server = await startServer({
-        env: {
-          HOST: '127.0.0.1',
-          PORT: String(port),
-          CONTROLLER_DATA_DIR: dataPath,
-        },
+        env: healthEnvironment,
         fetcher: () => {
           fetchCalls += 1;
           return Promise.reject(
@@ -242,7 +273,7 @@ describe('HTTP server and controller wiring', () => {
           CONTROLLER_DATA_DIR: dataDir,
           HOST: '127.0.0.1',
           PORT: String(port),
-          DEMO_STEP_MS: '10000',
+          PI_FLOW_CONFIG: FLOW_CONFIG_PATH,
         },
         fetcher,
         service: {
@@ -250,8 +281,10 @@ describe('HTTP server and controller wiring', () => {
           sleep: sleeper.sleep,
           pollIntervalMs: 100,
           outboxIntervalMs: 100,
+          agentRuntimeForTests: UNSUPPORTED_AGENT_RUNTIME,
         },
       });
+      openReadyGate(clock, sleeper);
       expect(server.config.mode).toBe('bot');
       expect(await pathExists(join(dataDir, 'controller.lock'))).toBe(true);
       const health = await server.app.inject({ method: 'GET', url: '/health' });
@@ -262,22 +295,19 @@ describe('HTTP server and controller wiring', () => {
       if (currentJobId === undefined)
         throw new Error('Queued Job ID was not sent.');
 
-      updates.push(
-        makeUpdate(3, `/steer ${currentJobId} add context`),
-        makeUpdate(4, `/status ${currentJobId}`),
-      );
+      updates.push(makeUpdate(3, `/status ${currentJobId}`));
       await pumpUntil(
         sleeper,
         () =>
           bodies.some(
             (body) =>
               typeof body['text'] === 'string' &&
-              body['text'].includes('Steering saved for job'),
+              body['text'].includes(`Job ${currentJobId} — COMPLETED`),
           ) &&
           bodies.some(
             (body) =>
               typeof body['text'] === 'string' &&
-              body['text'].includes('Steering: pending=1'),
+              body['text'].includes('Flow: intake/unsupported'),
           ),
       );
       expect(methods).toContain('getUpdates');
@@ -288,22 +318,9 @@ describe('HTTP server and controller wiring', () => {
         bodies.some(
           (body) =>
             typeof body['text'] === 'string' &&
-            body['text'].includes(`Job ${currentJobId} — RUNNING`),
+            body['text'].includes('目前沒有符合目標的已註冊能力'),
         ),
       ).toBe(true);
-
-      sleeper.releaseAtMost(10_000);
-      await pumpUntil(
-        sleeper,
-        () =>
-          bodies.some(
-            (body) =>
-              typeof body['text'] === 'string' &&
-              body['text'].includes('Completed. Original input: one-job') &&
-              body['text'].includes('add context'),
-          ),
-        10_000,
-      );
       const response = await fetch(`http://127.0.0.1:${String(port)}/health`);
       expect(response.status).toBe(200);
       const store = serviceStore(server);
@@ -318,6 +335,278 @@ describe('HTTP server and controller wiring', () => {
     }
   });
 
+  it('fails bot startup closed for missing, invalid, and oversized Flow config before opening resources', async () => {
+    await ensureConfigFixtureDirectory();
+    const missing = join(CONFIG_FIXTURE_DIR, 'missing-flow-config.json');
+    const invalid = join(CONFIG_FIXTURE_DIR, 'invalid-flow-config.json');
+    const oversized = join(CONFIG_FIXTURE_DIR, 'oversized-flow-config.json');
+    const privateRaw = '{"private":"DO_NOT_ECHO"';
+    await writeFile(invalid, privateRaw, { mode: 0o600 });
+    await writeFile(oversized, Buffer.alloc(MAX_FLOW_CONFIG_BYTES + 1, 0x20), {
+      mode: 0o600,
+    });
+    const cases = [
+      { name: 'missing', path: missing, code: 'FLOW_CONFIG_MISSING' },
+      { name: 'invalid', path: invalid, code: 'FLOW_CONFIG_INVALID' },
+      { name: 'oversized', path: oversized, code: 'FLOW_CONFIG_TOO_LARGE' },
+    ] as const;
+    for (const testCase of cases) {
+      const dataDir = join(CONFIG_FIXTURE_DIR, `data-${testCase.name}`);
+      let fetchCalls = 0;
+      let failure: unknown;
+      try {
+        await startServer({
+          env: {
+            TELEGRAM_BOT_TOKEN: TEST_TOKEN,
+            TELEGRAM_ALLOWED_USER_ID: USER_ID,
+            PI_FLOW_CONFIG: testCase.path,
+            CONTROLLER_DATA_DIR: dataDir,
+            HOST: '127.0.0.1',
+            PORT: '3000',
+          },
+          fetcher: () => {
+            fetchCalls += 1;
+            return Promise.reject(new Error('Telegram must not be called.'));
+          },
+        });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({
+        code: testCase.code,
+        message: testCase.code,
+      });
+      expect((failure as Error).message).not.toContain(privateRaw);
+      expect((failure as Error).message).not.toContain(testCase.path);
+      expect(await pathExists(dataDir)).toBe(false);
+      expect(fetchCalls).toBe(0);
+    }
+  });
+
+  it('requires auth before resources for effective pi-login nodes and accepts full API-key Node overrides', async () => {
+    await ensureConfigFixtureDirectory();
+    const source = JSON.parse(await readFile(OAUTH_CONFIG_PATH, 'utf8')) as {
+      schemaVersion: number;
+      flows: Array<{
+        runtime: Record<string, unknown>;
+        nodes: Array<{ kind: string; runtime?: Record<string, unknown> }>;
+      }>;
+    };
+    const apiKeyRuntime = {
+      provider: 'openai',
+      model: 'gpt-6-luna',
+      thinking: 'max',
+      apiKeyEnv: 'OPENAI_API_KEY',
+      auth: { mode: 'api-key' },
+    };
+    const partial = structuredClone(source);
+    const firstAgent = partial.flows[0]?.nodes.find(
+      (node) => node.kind === 'agent',
+    );
+    if (firstAgent === undefined) throw new Error('Expected an Agent Node.');
+    firstAgent.runtime = apiKeyRuntime;
+    const partialPath = join(
+      CONFIG_FIXTURE_DIR,
+      'oauth-partial-node-override.json',
+    );
+    await writeFile(partialPath, JSON.stringify(partial), { mode: 0o600 });
+
+    const cases = [
+      { name: 'oauth-no-auth', configPath: OAUTH_CONFIG_PATH },
+      { name: 'oauth-partial-node-override', configPath: partialPath },
+    ] as const;
+    for (const testCase of cases) {
+      const dataDir = join(CONFIG_FIXTURE_DIR, `data-${testCase.name}`);
+      const port = await availablePort();
+      let fetchCalls = 0;
+      let server: RunningServer | undefined;
+      let failure: unknown;
+      try {
+        server = await startServer({
+          env: {
+            TELEGRAM_BOT_TOKEN: TEST_TOKEN,
+            TELEGRAM_ALLOWED_USER_ID: USER_ID,
+            PI_FLOW_CONFIG: testCase.configPath,
+            CONTROLLER_DATA_DIR: dataDir,
+            HOST: '127.0.0.1',
+            PORT: String(port),
+          },
+          fetcher: () => {
+            fetchCalls += 1;
+            return Promise.reject(new Error('Telegram must not be called.'));
+          },
+        });
+      } catch (error) {
+        failure = error;
+      } finally {
+        await server?.close();
+      }
+      expect(failure).toMatchObject({
+        message: 'PI_FLOW_AUTH_FILE is required for pi-login authentication.',
+      });
+      expect((failure as Error).message).not.toContain(testCase.configPath);
+      expect(await pathExists(dataDir)).toBe(false);
+      expect(await canConnect(port)).toBe(false);
+      expect(fetchCalls).toBe(0);
+    }
+
+    const fullyOverridden = structuredClone(source);
+    for (const flow of fullyOverridden.flows) {
+      for (const node of flow.nodes) {
+        if (node.kind === 'agent') node.runtime = apiKeyRuntime;
+      }
+    }
+    const fullPath = join(CONFIG_FIXTURE_DIR, 'oauth-full-node-overrides.json');
+    await writeFile(fullPath, JSON.stringify(fullyOverridden), { mode: 0o600 });
+    const fullDataDir = join(CONFIG_FIXTURE_DIR, 'data-full-node-overrides');
+    const fullPort = await availablePort();
+    let fetchCalls = 0;
+    let server: RunningServer | undefined;
+    try {
+      server = await startServer({
+        env: {
+          TELEGRAM_BOT_TOKEN: TEST_TOKEN,
+          TELEGRAM_ALLOWED_USER_ID: USER_ID,
+          PI_FLOW_CONFIG: fullPath,
+          CONTROLLER_DATA_DIR: fullDataDir,
+          HOST: '127.0.0.1',
+          PORT: String(fullPort),
+        },
+        fetcher: () => {
+          fetchCalls += 1;
+          return Promise.reject(new Error('Telegram must not be called.'));
+        },
+      });
+      expect(server.config.mode).toBe('bot');
+      expect(server.config).not.toHaveProperty('piAuthFile');
+      expect(fetchCalls).toBe(0);
+    } finally {
+      await server?.close();
+      await rm(fullDataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('passes the configured auth source through production Server and Service to the real Pi runtime', async () => {
+    await ensureConfigFixtureDirectory();
+    const sourceDirectory = join(CONFIG_FIXTURE_DIR, 'synthetic-oauth-source');
+    await mkdir(sourceDirectory, { recursive: true, mode: 0o700 });
+    const authPath = join(sourceDirectory, 'auth.json');
+    const rawSourceMarker = 'SYNTHETIC_MALFORMED_AUTH_SOURCE_MARKER';
+    await writeFile(authPath, `{"synthetic":"${rawSourceMarker}"`, {
+      mode: 0o600,
+    });
+    const dataDir = artifactsPath('server-production-oauth-wiring').replace(
+      /\.sqlite$/,
+      '',
+    );
+    const port = await availablePort();
+    const sleeper = new ManualSleep();
+    const clock = new ManualClock();
+    const updates = [
+      makeUpdate(1, '/new oauth-source-session'),
+      makeUpdate(2, '/queue invalid OAuth source'),
+    ];
+    const methods: string[] = [];
+    const bodies: Array<Record<string, unknown>> = [];
+    let sendCount = 0;
+    let server: RunningServer | undefined;
+    const fetcher: FetchLike = (input, init) => {
+      const method = methodName(input);
+      methods.push(method);
+      if (method === 'getUpdates') return updateResponse(updates.splice(0));
+      if (method !== 'sendMessage')
+        throw new Error(`Unexpected fake Telegram method ${method}.`);
+      const body = bodyOf(init);
+      bodies.push(body);
+      sendCount += 1;
+      return jsonResponse({
+        message_id: 20_000 + sendCount,
+        chat: { id: Number(body['chat_id']) },
+      });
+    };
+    try {
+      server = await startServer({
+        env: {
+          TELEGRAM_BOT_TOKEN: TEST_TOKEN,
+          TELEGRAM_ALLOWED_USER_ID: USER_ID,
+          PI_FLOW_CONFIG: OAUTH_CONFIG_PATH,
+          PI_FLOW_AUTH_FILE: authPath,
+          CONTROLLER_DATA_DIR: dataDir,
+          HOST: '127.0.0.1',
+          PORT: String(port),
+        },
+        fetcher,
+        service: {
+          clock,
+          sleep: sleeper.sleep,
+          pollIntervalMs: 100,
+          outboxIntervalMs: 100,
+        },
+      });
+      openReadyGate(clock, sleeper);
+      const activeServer = server;
+      let jobId: string | undefined;
+      const queuedJob = (): string | undefined => {
+        for (const body of bodies) {
+          if (typeof body['text'] !== 'string') continue;
+          const match = /Queued job ([^\n.]+)\./.exec(body['text']);
+          if (match?.[1] !== undefined) return match[1];
+        }
+        return undefined;
+      };
+      await pumpUntil(sleeper, () => {
+        jobId = queuedJob();
+        return (
+          jobId !== undefined &&
+          serviceStore(activeServer).statusForJob(USER_ID, jobId)?.status ===
+            'FAILED'
+        );
+      });
+      jobId = queuedJob();
+      if (jobId === undefined) throw new Error('Expected a queued Job.');
+      const activeJobId = jobId;
+      const store = serviceStore(activeServer);
+      const status = store.statusForJob(USER_ID, activeJobId);
+      expect(status).toMatchObject({
+        status: 'FAILED',
+        failureCode: 'FLOW_AUTH_SOURCE_INVALID',
+      });
+
+      updates.push(makeUpdate(3, `/status ${activeJobId}`));
+      await pumpUntil(sleeper, () =>
+        bodies.some(
+          (body) =>
+            typeof body['text'] === 'string' &&
+            body['text'].includes(`Job ${activeJobId} — FAILED`),
+        ),
+      );
+      const outboxTexts = store.database
+        .prepare('SELECT text FROM outbox WHERE job_id=?')
+        .all(activeJobId) as Array<{ text: string }>;
+      const allPublicText = [
+        ...bodies.map((body) => body['text']),
+        ...outboxTexts.map((row) => row.text),
+        JSON.stringify(status),
+      ].join('\n');
+      expect(allPublicText).toContain('FLOW_AUTH_SOURCE_INVALID');
+      expect(allPublicText).not.toContain(rawSourceMarker);
+      expect(allPublicText).not.toContain(authPath);
+      expect(JSON.stringify(status)).not.toContain(rawSourceMarker);
+      expect(JSON.stringify(status)).not.toContain(authPath);
+      expect(methods).toContain('getUpdates');
+      expect(methods).toContain('sendMessage');
+      expect(methods).not.toContain('provider');
+      expect(await pathExists(join(dataDir, 'pi'))).toBe(false);
+      expect(await readFile(authPath, 'utf8')).toBe(
+        `{"synthetic":"${rawSourceMarker}"`,
+      );
+    } finally {
+      await server?.close();
+      await rm(dataDir, { recursive: true, force: true });
+      await rm(sourceDirectory, { recursive: true, force: true });
+    }
+  });
+
   it('closes HTTP and controller when the external fatal callback throws', async () => {
     const dataDir = artifactsPath('server-fatal-callback').replace(
       /\.sqlite$/,
@@ -325,6 +614,8 @@ describe('HTTP server and controller wiring', () => {
     );
     const port = await availablePort();
     const log = logger();
+    const sleeper = new ManualSleep();
+    const clock = new ManualClock();
     const originalExitCode = process.exitCode;
     const methods: string[] = [];
     let callbackCalls = 0;
@@ -341,12 +632,15 @@ describe('HTTP server and controller wiring', () => {
         env: {
           TELEGRAM_BOT_TOKEN: TEST_TOKEN,
           TELEGRAM_ALLOWED_USER_ID: USER_ID,
+          PI_FLOW_CONFIG: FLOW_CONFIG_PATH,
           CONTROLLER_DATA_DIR: dataDir,
           HOST: '127.0.0.1',
           PORT: String(port),
         },
         fetcher,
         service: {
+          clock,
+          sleep: sleeper.sleep,
           logger: log,
           onFatal: () => {
             callbackCalls += 1;
@@ -354,6 +648,7 @@ describe('HTTP server and controller wiring', () => {
           },
         },
       });
+      openReadyGate(clock, sleeper);
       for (let attempt = 0; attempt < 200 && callbackCalls === 0; attempt += 1)
         await flushTasks();
       expect(callbackCalls).toBe(1);
@@ -367,7 +662,8 @@ describe('HTTP server and controller wiring', () => {
       expect(log.messages).toContain('fatal shutdown callback failed');
       expect(log.messages.join('\n')).not.toContain(TEST_TOKEN);
       expect(log.messages.join('\n')).not.toContain(SECRET_URL);
-      expect(methods).toEqual(['getUpdates']);
+      expect(methods).toContain('getUpdates');
+      expect(methods).toContain('sendMessage');
       const store = serviceStore(server);
       expect(() => store.getOffset()).toThrow();
     } finally {

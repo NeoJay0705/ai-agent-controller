@@ -215,12 +215,14 @@ QUEUED → RUNNING → COMPLETED | FAILED
 - v1 不提供自動 retention。操作者負責管理、備份與清理本機資料。
 - 此方案不是 HA，不支援水平擴展或多 controller process。
 
-### 9.2 Exclusive lock
+### 9.2 Linux kernel lock
 
-- Bot 模式建立 `CONTROLLER_DATA_DIR`（預設 `./data`），並在其中以 exclusive create（例如 `open(..., 'wx')`）建立 controller lock。
-- Lock 只保存非秘密的程序識別資訊。發現既存 lock 即啟動失敗；程式不試圖刪除、判斷或修復 stale lock。
-- 異常退出可留下 lock。操作者必須先確認沒有 controller 活程序，再手動移除 lock。不得自動清理。
-- 資料目錄與 SQLite 檔案權限須限制為執行帳號可存取。
+- Bot 模式只支援 Linux，並固定使用 `/usr/bin/flock`（util-linux），不安裝依賴、不提供 PID fallback。資料目錄必須 canonical、由目前 UID 擁有且為 `0700`。此鎖只支援本機 filesystem；共享跨主機 data、HA 與多程序資料庫存取不受支援。
+- `controller.kernel.lock` 是永久非秘密 anchor。以 no-follow、安全模式開啟後，Node 持有原始 FD；短命 `/usr/bin/flock --exclusive --nonblock --conflict-exit-code 73 3` helper 透過 FD 3 取得 kernel lock。Anchor 不截斷、不 unlink、不 rename；正常關閉後仍存在，存在本身不表示 busy，也不得叫操作者刪除它解鎖。
+- `controller.lock` 是給舊版 `wx` 程序相容的原子 marker，記錄版本、PID、隨機 token 與 anchor device/inode。Kernel lock 成功後，若 marker 是同 anchor 的完整已知新版 record，代表遵守本協定的舊 owner 已不再持鎖，可原子取代 stale record。正常關閉只刪除 token 與 inode 都符合本 lease 的 marker。
+- Numeric PID-only marker（不論 PID 活著或不存在）、空 marker、毀損／未知格式或不同 anchor marker 一律保留並 fail closed。程式不得依 PID、mtime 或 timeout 判斷 stale，也不得猜測修復。操作者須先確認所有 Controller 停止，再一次性確認移除 legacy／unknown `controller.lock`；不得移除 anchor 或運作中程序的 lock 檔。
+- SIGKILL／crash 由 Linux 自動釋放 kernel lock。下次啟動可在取得相同 anchor lock 後回收有效新版 stale marker。非 Linux、helper 不存在、逾時或其他不確定錯誤均安全拒絕啟動。
+- Shutdown 與 startup cleanup 順序為關閉業務 SQLite DB，再刪除確切自有 marker，最後關閉 anchor FD。若 DB close 失敗，不得提早釋放 kernel lock。
 
 ### 9.3 環境與生命週期
 

@@ -24,11 +24,14 @@ export type ControllerConfig = ControllerConfigCommon &
         readonly mode: 'health';
         readonly token?: never;
         readonly allowedUserId?: never;
+        readonly piAuthFile?: never;
       }
     | {
         readonly mode: 'bot';
         readonly token: string;
         readonly allowedUserId: string;
+        readonly flowConfigPath: string;
+        readonly piAuthFile?: string;
       }
   );
 
@@ -45,6 +48,7 @@ export interface TelegramChat {
 
 export interface TelegramMessage {
   readonly message_id: number;
+  readonly date?: unknown;
   readonly chat: TelegramChat;
   readonly from?: TelegramUser;
   readonly text?: string;
@@ -94,12 +98,14 @@ export interface OutboxRecord {
   readonly text: string;
   readonly attempts: number;
   readonly chatId: string;
+  readonly promptGeneration: number | null;
 }
 
 export interface PromptRecord {
   readonly jobId: string;
   readonly ownerId: string;
   readonly active: boolean;
+  readonly generation: number;
 }
 
 export interface TelegramSentMessage {

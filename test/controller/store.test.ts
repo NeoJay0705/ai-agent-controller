@@ -29,6 +29,36 @@ function closeReopenedStores(stores: readonly ControllerStore[]): void {
   for (const store of stores) store.close();
 }
 
+function downgradeToV1(database: DatabaseSync): void {
+  database.exec(`
+    DROP TABLE outbox_cancellations;
+    DROP TABLE pi_sessions;
+    DROP TABLE session_facts;
+    DROP TABLE flow_runs;
+    ALTER TABLE outbox DROP COLUMN prompt_generation;
+    ALTER TABLE prompt_bindings DROP COLUMN generation;
+    PRAGMA user_version = 1;
+  `);
+}
+
+function createV1Fixture(path: string, offset: string | null): void {
+  const initial = new ControllerStore(new DatabaseSync(path));
+  initial.close();
+  const database = new DatabaseSync(path);
+  try {
+    downgradeToV1(database);
+    if (offset === null) {
+      database.prepare("DELETE FROM meta WHERE key='next_poll_offset'").run();
+    } else {
+      database
+        .prepare("UPDATE meta SET value=? WHERE key='next_poll_offset'")
+        .run(offset);
+    }
+  } finally {
+    database.close();
+  }
+}
+
 describe('SQLite controller persistence and recovery', () => {
   beforeEach(async () => {
     await ensureArtifactsDirectory();
@@ -198,7 +228,9 @@ describe('SQLite controller persistence and recovery', () => {
         now: () => 1000,
       });
       stores.push(store);
-      const router = new TelegramRouter(store, testConfig());
+      const router = new TelegramRouter(store, testConfig(), {
+        readyAtSec: () => 0,
+      });
       router.handle(makeUpdate(20, '/new persisted-binding'));
       router.handle(makeUpdate(21, '/queue persisted-queued'));
       const queued = store.database.prepare('SELECT id FROM jobs').get() as {
@@ -289,6 +321,352 @@ describe('SQLite controller persistence and recovery', () => {
     } finally {
       await runner?.stop();
       closeReopenedStores(stores);
+      await removeDatabaseArtifacts(path);
+    }
+  });
+
+  it('migrates a synthetic schema-v1 database to v2 without rewriting existing rows', async () => {
+    const path = artifactsPath('store-v1-migration');
+    const database = new DatabaseSync(path);
+    try {
+      let store = new ControllerStore(database, { now: () => 1000 });
+      const sessionId = createSession(store, 'migration-session');
+      const jobId = store.transaction(() =>
+        store.queueJob(USER_ID, CHAT_ID, 'legacy job', 10),
+      );
+      store.transaction(() => {
+        store.enqueueJobNotification(jobId, 'prompt', 'legacy prompt', 0);
+        store.database
+          .prepare("UPDATE jobs SET status='WAITING_INPUT' WHERE id=?")
+          .run(jobId);
+      });
+      const prompt = store
+        .dueOutbox(1000)
+        .find((item) => item.kind === 'prompt');
+      if (prompt === undefined) throw new Error('Expected a legacy prompt.');
+      store.deliverOutbox(prompt.id, Number(CHAT_ID), 88001, 1001);
+      store.recordUpdate(55);
+
+      downgradeToV1(database);
+      database
+        .prepare("UPDATE meta SET value='0' WHERE key='next_poll_offset'")
+        .run();
+      database
+        .prepare(
+          "UPDATE meta SET value = CAST(MAX(CAST(value AS INTEGER), ?) AS TEXT) WHERE key='next_poll_offset'",
+        )
+        .run(56);
+      expect(
+        database
+          .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+          .get(),
+      ).toEqual({ value: '56.0' });
+      store = new ControllerStore(database, { now: () => 2000 });
+
+      expect(
+        (
+          database.prepare('PRAGMA user_version').get() as {
+            user_version: number;
+          }
+        ).user_version,
+      ).toBe(2);
+      expect(store.getOffset()).toBe(56);
+      expect(
+        database
+          .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+          .get(),
+      ).toEqual({ value: '56' });
+      expect(store.isUpdateProcessed(55)).toBe(true);
+      expect(store.statusForJob(USER_ID, jobId)).toMatchObject({
+        sessionId,
+        input: 'legacy job',
+        status: 'WAITING_INPUT',
+      });
+      expect(store.findPrompt(CHAT_ID, 88001)).toMatchObject({
+        jobId,
+        active: true,
+        generation: 0,
+      });
+      expect(
+        database
+          .prepare('SELECT status, prompt_generation FROM outbox WHERE id=?')
+          .get(prompt.id),
+      ).toEqual({ status: 'DELIVERED', prompt_generation: null });
+      expect(
+        database.prepare('SELECT COUNT(*) AS count FROM outbox').get(),
+      ).toEqual({ count: 3 });
+      expect(
+        database
+          .prepare('SELECT COUNT(*) AS count FROM messages WHERE job_id=?')
+          .get(jobId),
+      ).toEqual({ count: 1 });
+      expect(
+        database
+          .prepare('SELECT COUNT(*) AS count FROM bindings WHERE session_id=?')
+          .get(sessionId),
+      ).toEqual({ count: 1 });
+      expect(
+        database.prepare('SELECT COUNT(*) AS count FROM flow_runs').get(),
+      ).toEqual({ count: 0 });
+    } finally {
+      try {
+        database.close();
+      } catch {
+        // A failed migration closes its connection before the assertion.
+      }
+      await removeDatabaseArtifacts(path);
+    }
+  });
+
+  it('preserves a canonical schema-v1 offset string during migration', async () => {
+    const path = artifactsPath('store-v1-canonical-offset');
+    try {
+      createV1Fixture(path, '0007');
+      const store = new ControllerStore(new DatabaseSync(path));
+      try {
+        expect(store.getOffset()).toBe(7);
+        expect(
+          store.database
+            .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+            .get(),
+        ).toEqual({ value: '0007' });
+      } finally {
+        store.close();
+      }
+    } finally {
+      await removeDatabaseArtifacts(path);
+    }
+  });
+
+  it('migrates a zero-valued legacy decimal without changing its value', async () => {
+    const path = artifactsPath('store-v1-zero-legacy-offset');
+    try {
+      createV1Fixture(path, '0.000');
+      const store = new ControllerStore(new DatabaseSync(path));
+      try {
+        expect(store.getOffset()).toBe(0);
+        expect(
+          store.database
+            .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+            .get(),
+        ).toEqual({ value: '0' });
+        expect(
+          store.database.prepare('PRAGMA user_version').get(),
+        ).toMatchObject({ user_version: 2 });
+      } finally {
+        store.close();
+      }
+    } finally {
+      await removeDatabaseArtifacts(path);
+    }
+  });
+
+  it('migrates the exact MAX_SAFE_INTEGER legacy boundary without changing its value', async () => {
+    const path = artifactsPath('store-v1-max-safe-offset');
+    const offset = `${String(Number.MAX_SAFE_INTEGER)}.0`;
+    try {
+      createV1Fixture(path, offset);
+      const store = new ControllerStore(new DatabaseSync(path));
+      try {
+        expect(store.getOffset()).toBe(Number.MAX_SAFE_INTEGER);
+        expect(
+          store.database
+            .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+            .get(),
+        ).toEqual({ value: String(Number.MAX_SAFE_INTEGER) });
+        expect(
+          store.database.prepare('PRAGMA user_version').get(),
+        ).toMatchObject({ user_version: 2 });
+      } finally {
+        store.close();
+      }
+    } finally {
+      await removeDatabaseArtifacts(path);
+    }
+  });
+
+  it.each([
+    '9007199254740992',
+    '-1',
+    '+1',
+    ' 1',
+    '1 ',
+    '',
+    'NaN',
+    'Infinity',
+    '1e3',
+    '1.5',
+    '1.00000000000000001',
+    '9007199254740992.0',
+    '1\n',
+    '1\r',
+    '1\r\n',
+    '1\u2028',
+    '1\u2029',
+    '1.0\n',
+    '1.0\r',
+    '1.0\r\n',
+    '1.0\u2028',
+    '1.0\u2029',
+  ])(
+    'rejects invalid schema-v1 poll metadata %j without changing it',
+    async (offset) => {
+      const path = artifactsPath('store-v1-invalid-offset');
+      try {
+        createV1Fixture(path, offset);
+        expect(() => new ControllerStore(new DatabaseSync(path))).toThrow(
+          'Controller database metadata is incomplete.',
+        );
+        const database = new DatabaseSync(path);
+        try {
+          expect(
+            database
+              .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+              .get(),
+          ).toEqual({ value: offset });
+          expect(database.prepare('PRAGMA user_version').get()).toMatchObject({
+            user_version: 1,
+          });
+        } finally {
+          database.close();
+        }
+      } finally {
+        await removeDatabaseArtifacts(path);
+      }
+    },
+  );
+
+  it('rejects missing schema-v1 poll metadata without changing the schema version', async () => {
+    const path = artifactsPath('store-v1-missing-offset');
+    try {
+      createV1Fixture(path, null);
+      expect(() => new ControllerStore(new DatabaseSync(path))).toThrow(
+        'Controller database metadata is incomplete.',
+      );
+      const database = new DatabaseSync(path);
+      try {
+        expect(
+          database
+            .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+            .get(),
+        ).toBeUndefined();
+        expect(database.prepare('PRAGMA user_version').get()).toMatchObject({
+          user_version: 1,
+        });
+      } finally {
+        database.close();
+      }
+    } finally {
+      await removeDatabaseArtifacts(path);
+    }
+  });
+
+  it.each(['1\n', '1\r', '1\r\n', '1\u2028', '1\u2029'])(
+    'rejects schema-v2 poll metadata ending in a line terminator %j without changing it',
+    async (offset) => {
+      const path = artifactsPath('store-v2-line-terminated-offset');
+      const initialized = new ControllerStore(new DatabaseSync(path));
+      initialized.database
+        .prepare("UPDATE meta SET value=? WHERE key='next_poll_offset'")
+        .run(offset);
+      initialized.close();
+      try {
+        expect(() => new ControllerStore(new DatabaseSync(path))).toThrow(
+          'Controller database metadata is incomplete.',
+        );
+        const database = new DatabaseSync(path);
+        try {
+          expect(
+            database
+              .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+              .get(),
+          ).toEqual({ value: offset });
+          expect(database.prepare('PRAGMA user_version').get()).toMatchObject({
+            user_version: 2,
+          });
+        } finally {
+          database.close();
+        }
+      } finally {
+        await removeDatabaseArtifacts(path);
+      }
+    },
+  );
+
+  it('keeps schema-v2 poll metadata validation strict for legacy decimal strings', async () => {
+    const path = artifactsPath('store-v2-decimal-offset');
+    const initialized = new ControllerStore(new DatabaseSync(path));
+    initialized.database
+      .prepare("UPDATE meta SET value='1.0' WHERE key='next_poll_offset'")
+      .run();
+    initialized.close();
+    try {
+      expect(() => new ControllerStore(new DatabaseSync(path))).toThrow(
+        'Controller database metadata is incomplete.',
+      );
+      const database = new DatabaseSync(path);
+      try {
+        expect(
+          database
+            .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+            .get(),
+        ).toEqual({ value: '1.0' });
+        expect(database.prepare('PRAGMA user_version').get()).toMatchObject({
+          user_version: 2,
+        });
+      } finally {
+        database.close();
+      }
+    } finally {
+      await removeDatabaseArtifacts(path);
+    }
+  });
+
+  it('rolls back the legacy offset and all v1-to-v2 DDL after a schema conflict', async () => {
+    const path = artifactsPath('store-v1-migration-rollback');
+    try {
+      createV1Fixture(path, '56.0');
+      const raw = new DatabaseSync(path);
+      raw
+        .prepare(
+          'INSERT INTO sessions(id, owner_id, name, created_at, next_sequence) VALUES (?, ?, ?, ?, ?)',
+        )
+        .run('rollback-session', USER_ID, 'rollback', 1, 1);
+      raw.exec('CREATE TABLE flow_runs(conflicting INTEGER) STRICT');
+      raw.close();
+
+      expect(() => new ControllerStore(new DatabaseSync(path))).toThrow(
+        'Controller database migration failed.',
+      );
+      const database = new DatabaseSync(path);
+      try {
+        expect(
+          database
+            .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+            .get(),
+        ).toEqual({ value: '56.0' });
+        expect(database.prepare('PRAGMA user_version').get()).toMatchObject({
+          user_version: 1,
+        });
+        expect(database.prepare('SELECT id FROM sessions').all()).toEqual([
+          { id: 'rollback-session' },
+        ]);
+        expect(
+          database.prepare('PRAGMA table_info(outbox)').all(),
+        ).not.toContainEqual(
+          expect.objectContaining({ name: 'prompt_generation' }),
+        );
+        expect(
+          database
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type='table' AND name='session_facts'",
+            )
+            .get(),
+        ).toBeUndefined();
+      } finally {
+        database.close();
+      }
+    } finally {
       await removeDatabaseArtifacts(path);
     }
   });

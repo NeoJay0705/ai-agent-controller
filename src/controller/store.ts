@@ -11,8 +11,93 @@ import type {
   SessionRecord,
 } from './types.js';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+const PREVIOUS_SCHEMA_VERSION = 1;
 const MAX_OUTBOX_UNITS = 3500;
+const V1_REQUIRED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  meta: ['key', 'value'],
+  processed_updates: ['update_id', 'processed_at'],
+  sessions: ['id', 'owner_id', 'name', 'created_at', 'next_sequence'],
+  bindings: ['user_id', 'chat_id', 'session_id'],
+  jobs: [
+    'id',
+    'session_id',
+    'owner_id',
+    'chat_id',
+    'sequence',
+    'input',
+    'status',
+    'checkpoint',
+    'started_at',
+    'deadline_at',
+    'failure_code',
+    'created_at',
+    'updated_at',
+  ],
+  messages: [
+    'id',
+    'session_id',
+    'job_id',
+    'kind',
+    'sequence',
+    'content',
+    'received_at',
+    'applied_at',
+    'steering_state',
+  ],
+  outbox: [
+    'id',
+    'batch_id',
+    'session_id',
+    'job_id',
+    'kind',
+    'chunk_index',
+    'text',
+    'chat_id',
+    'status',
+    'attempts',
+    'next_attempt_at',
+    'created_at',
+    'delivered_at',
+  ],
+  prompt_bindings: [
+    'chat_id',
+    'message_id',
+    'job_id',
+    'owner_id',
+    'active',
+    'created_at',
+  ],
+};
+const V2_ADDITIONAL_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  outbox: ['prompt_generation'],
+  prompt_bindings: ['generation'],
+  flow_runs: [
+    'job_id',
+    'bundle_json',
+    'flow_id',
+    'node_id',
+    'state_json',
+    'revision',
+    'transitions',
+    'prompt_generation',
+    'wait_deadline',
+    'job_deadline',
+  ],
+  session_facts: [
+    'session_id',
+    'owner_id',
+    'kind',
+    'value_json',
+    'source_json',
+    'flow_version',
+    'bank_version',
+    'created_at',
+    'provenance',
+  ],
+  pi_sessions: ['session_id', 'pi_session_id', 'file_path'],
+  outbox_cancellations: ['outbox_id', 'reason', 'created_at'],
+};
 const activeJobStatuses = ['RUNNING', 'WAITING_INPUT'] as const;
 const terminalStatuses = ['COMPLETED', 'FAILED'] as const;
 
@@ -121,13 +206,44 @@ export class ControllerStore {
       .run(updateId, this.now());
     this.database
       .prepare(
-        "UPDATE meta SET value = CAST(MAX(CAST(value AS INTEGER), ?) AS TEXT) WHERE key = 'next_poll_offset'",
+        "UPDATE meta SET value = CAST(MAX(CAST(value AS INTEGER), CAST(? AS INTEGER)) AS TEXT) WHERE key = 'next_poll_offset'",
       )
       .run(updateId + 1);
   }
 
   reply(chatId: string, body: string, sessionId: string | null = null): void {
     this.enqueue(sessionId, null, 'reply', body, undefined, chatId);
+  }
+
+  /** Synchronous primitive for FlowStore transactions. Does not start a transaction. */
+  enqueueJobNotification(
+    jobId: string,
+    kind: OutboxKind,
+    text: string,
+    promptGeneration: number | null = null,
+  ): void {
+    const row = this.database
+      .prepare('SELECT session_id FROM jobs WHERE id=?')
+      .get(jobId) as { session_id?: unknown } | undefined;
+    if (row === undefined) throw new DomainError('NOT_FOUND', 'Job not found.');
+    if (
+      (kind === 'prompt' &&
+        (promptGeneration === null ||
+          !Number.isSafeInteger(promptGeneration) ||
+          promptGeneration < 0)) ||
+      (kind !== 'prompt' && promptGeneration !== null)
+    ) {
+      throw new TypeError('Invalid outbox prompt generation.');
+    }
+    this.enqueue(
+      asString(row.session_id, 'session id'),
+      jobId,
+      kind,
+      text,
+      undefined,
+      undefined,
+      promptGeneration,
+    );
   }
 
   createSession(ownerId: string, chatId: string, name: string): SessionRecord {
@@ -313,7 +429,7 @@ export class ControllerStore {
   findPrompt(chatId: string, messageId: number): PromptRecord | null {
     const row = this.database
       .prepare(
-        'SELECT job_id, owner_id, active FROM prompt_bindings WHERE chat_id = ? AND message_id = ?',
+        'SELECT job_id, owner_id, active, generation FROM prompt_bindings WHERE chat_id = ? AND message_id = ?',
       )
       .get(chatId, messageId) as Record<string, unknown> | undefined;
     if (row === undefined) return null;
@@ -321,6 +437,7 @@ export class ControllerStore {
       jobId: asString(row['job_id'], 'prompt job'),
       ownerId: asString(row['owner_id'], 'prompt owner'),
       active: asInteger(row['active'], 'prompt active') === 1,
+      generation: asInteger(row['generation'], 'prompt generation'),
     };
   }
 
@@ -330,9 +447,36 @@ export class ControllerStore {
     messageId: number,
     content: string,
     maxPendingSteering: number,
+    expectedGeneration?: number,
   ): void {
     const prompt = this.findPrompt(chatId, messageId);
-    if (prompt === null || prompt.ownerId !== ownerId || !prompt.active) {
+    const current = this.database
+      .prepare(
+        `SELECT j.status, f.prompt_generation
+         FROM jobs j LEFT JOIN flow_runs f ON f.job_id=j.id WHERE j.id=?`,
+      )
+      .get(prompt?.jobId ?? '') as
+      { status?: unknown; prompt_generation?: unknown } | undefined;
+    const currentGeneration =
+      current?.prompt_generation === null ||
+      current?.prompt_generation === undefined
+        ? 0
+        : asInteger(current.prompt_generation, 'flow prompt generation');
+    if (
+      prompt === null ||
+      prompt.ownerId !== ownerId ||
+      !prompt.active ||
+      prompt.generation !== currentGeneration ||
+      (expectedGeneration !== undefined &&
+        expectedGeneration !== prompt.generation) ||
+      current === undefined ||
+      !activeJobStatuses.includes(
+        asString(
+          current.status,
+          'job status',
+        ) as (typeof activeJobStatuses)[number],
+      )
+    ) {
       throw new DomainError(
         'STALE_PROMPT',
         'That question is no longer active.',
@@ -528,12 +672,26 @@ export class ControllerStore {
   dueOutbox(now: number, limit = 20): readonly OutboxRecord[] {
     const rows = this.database
       .prepare(
-        `SELECT o.id, o.session_id, o.job_id, o.kind, o.text, o.attempts, o.chat_id
-         FROM outbox o WHERE o.status='PENDING' AND o.next_attempt_at<=?
+        `SELECT o.id, o.session_id, o.job_id, o.kind, o.text, o.attempts, o.chat_id,
+                o.prompt_generation
+         FROM outbox o
+         LEFT JOIN jobs j ON j.id=o.job_id
+         LEFT JOIN flow_runs r ON r.job_id=o.job_id
+         WHERE o.status='PENDING' AND o.next_attempt_at<=?
+         AND NOT EXISTS (
+           SELECT 1 FROM outbox_cancellations c WHERE c.outbox_id=o.id
+         )
+         AND (o.kind!='prompt' OR (
+           j.status='WAITING_INPUT' AND
+           COALESCE(o.prompt_generation, 0)=COALESCE(r.prompt_generation, 0)
+         ))
          AND NOT EXISTS (
            SELECT 1 FROM outbox earlier
            WHERE earlier.batch_id=o.batch_id AND earlier.chunk_index<o.chunk_index
              AND earlier.status='PENDING'
+             AND NOT EXISTS (
+               SELECT 1 FROM outbox_cancellations c WHERE c.outbox_id=earlier.id
+             )
          )
          ORDER BY o.created_at, o.rowid LIMIT ?`,
       )
@@ -549,7 +707,31 @@ export class ControllerStore {
       text: asString(row['text'], 'outbox text'),
       attempts: asInteger(row['attempts'], 'outbox attempts'),
       chatId: asString(row['chat_id'], 'chat id'),
+      promptGeneration:
+        row['prompt_generation'] === null
+          ? null
+          : asInteger(row['prompt_generation'], 'outbox prompt generation'),
     }));
+  }
+
+  isOutboxSendable(outboxId: string): boolean {
+    return (
+      this.database
+        .prepare(
+          `SELECT 1 AS found FROM outbox o
+           LEFT JOIN jobs j ON j.id=o.job_id
+           LEFT JOIN flow_runs r ON r.job_id=o.job_id
+           WHERE o.id=? AND o.status='PENDING'
+           AND NOT EXISTS (
+             SELECT 1 FROM outbox_cancellations c WHERE c.outbox_id=o.id
+           )
+           AND (o.kind!='prompt' OR (
+             j.status='WAITING_INPUT' AND
+             COALESCE(o.prompt_generation, 0)=COALESCE(r.prompt_generation, 0)
+           ))`,
+        )
+        .get(outboxId) !== undefined
+    );
   }
 
   deliverOutbox(
@@ -574,18 +756,33 @@ export class ControllerStore {
         .prepare('SELECT status, owner_id FROM jobs WHERE id=?')
         .get(jobId) as { status?: unknown; owner_id?: unknown } | undefined;
       if (jobStatus === undefined) return;
-      const active = activeJobStatuses.includes(
-        asString(
-          jobStatus.status,
-          'job status',
-        ) as (typeof activeJobStatuses)[number],
-      );
+      const run = this.database
+        .prepare('SELECT prompt_generation FROM flow_runs WHERE job_id=?')
+        .get(jobId) as { prompt_generation?: unknown } | undefined;
+      const deliveredGeneration =
+        row['prompt_generation'] === null
+          ? 0
+          : asInteger(row['prompt_generation'], 'outbox prompt generation');
+      const currentGeneration =
+        run === undefined
+          ? 0
+          : asInteger(run.prompt_generation, 'flow prompt generation');
+      const cancelled =
+        this.database
+          .prepare(
+            'SELECT 1 AS found FROM outbox_cancellations WHERE outbox_id=?',
+          )
+          .get(outboxId) !== undefined;
+      const active =
+        !cancelled &&
+        deliveredGeneration === currentGeneration &&
+        asString(jobStatus.status, 'job status') === 'WAITING_INPUT';
       this.database
         .prepare(
-          `INSERT INTO prompt_bindings(chat_id, message_id, job_id, owner_id, active, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)
+          `INSERT INTO prompt_bindings(chat_id, message_id, job_id, owner_id, active, created_at, generation)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(chat_id, message_id) DO UPDATE SET job_id=excluded.job_id,
-             owner_id=excluded.owner_id, active=excluded.active`,
+             owner_id=excluded.owner_id, active=excluded.active, generation=excluded.generation`,
         )
         .run(
           String(chatId),
@@ -594,6 +791,7 @@ export class ControllerStore {
           asString(jobStatus.owner_id, 'job owner'),
           active ? 1 : 0,
           now,
+          deliveredGeneration,
         );
     });
   }
@@ -625,7 +823,11 @@ export class ControllerStore {
       user_version?: unknown;
     };
     const version = asInteger(versionRow.user_version, 'schema version');
-    if (version !== 0 && version !== SCHEMA_VERSION) {
+    if (
+      version !== 0 &&
+      version !== PREVIOUS_SCHEMA_VERSION &&
+      version !== SCHEMA_VERSION
+    ) {
       throw new Error(
         `Unsupported controller database schema version ${String(version)}.`,
       );
@@ -643,30 +845,36 @@ export class ControllerStore {
       }
       return;
     }
-    const required = new Set([
-      'meta',
-      'processed_updates',
-      'sessions',
-      'bindings',
-      'jobs',
-      'messages',
-      'outbox',
-      'prompt_bindings',
-    ]);
-    const tables = this.database
+    this.validateVersionedSchema(version);
+  }
+
+  private validateVersionedSchema(version: number): void {
+    const requiredColumns: Record<string, readonly string[]> = {
+      ...V1_REQUIRED_COLUMNS,
+      ...(version === SCHEMA_VERSION ? V2_ADDITIONAL_COLUMNS : {}),
+    };
+    const tableRows = this.database
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
       )
       .all() as { name: unknown }[];
-    for (const table of tables)
-      required.delete(asString(table.name, 'table name'));
-    if (required.size > 0)
-      throw new Error('Controller database schema is incomplete.');
-    const offset = this.database
-      .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
-      .get();
-    if (offset === undefined)
-      throw new Error('Controller database metadata is incomplete.');
+    const tables = new Set(
+      tableRows.map((table) => asString(table.name, 'table name')),
+    );
+    for (const [table, columns] of Object.entries(requiredColumns)) {
+      if (!tables.has(table))
+        throw new Error('Controller database schema is incomplete.');
+      const columnRows = this.database
+        .prepare(`PRAGMA table_info('${table}')`)
+        .all() as { name: unknown }[];
+      const found = new Set(
+        columnRows.map((column) => asString(column.name, 'column name')),
+      );
+      if (columns.some((column) => !found.has(column))) {
+        throw new Error('Controller database schema is incomplete.');
+      }
+    }
+    readPollMetadata(this.database, version);
   }
 
   private initializeSchema(): void {
@@ -674,17 +882,21 @@ export class ControllerStore {
       user_version?: unknown;
     };
     const version = asInteger(versionRow.user_version, 'schema version');
+    if (version === SCHEMA_VERSION) return;
+    if (version === PREVIOUS_SCHEMA_VERSION) {
+      this.migrateSchema1To2();
+      return;
+    }
+    if (version !== 0) {
+      throw new Error(
+        `Unsupported controller database schema version ${String(version)}.`,
+      );
+    }
     const existing = this.database
       .prepare(
         "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
       )
       .get() as { count: unknown };
-    if (version !== 0 && version !== SCHEMA_VERSION) {
-      throw new Error(
-        `Unsupported controller database schema version ${String(version)}.`,
-      );
-    }
-    if (version === SCHEMA_VERSION) return;
     if (asInteger(existing.count, 'existing tables') !== 0) {
       throw new Error(
         'Unversioned database is not empty; refusing to modify it.',
@@ -750,9 +962,73 @@ export class ControllerStore {
         created_at INTEGER NOT NULL, PRIMARY KEY(chat_id, message_id),
         FOREIGN KEY(job_id, owner_id) REFERENCES jobs(id, owner_id)
       ) STRICT;
-      PRAGMA user_version = ${String(SCHEMA_VERSION)};
+      PRAGMA user_version = ${String(PREVIOUS_SCHEMA_VERSION)};
       COMMIT;
     `);
+    this.migrateSchema1To2();
+  }
+
+  private migrateSchema1To2(): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const offset = readPollMetadata(this.database, PREVIOUS_SCHEMA_VERSION);
+      if (offset.legacy) {
+        this.database
+          .prepare("UPDATE meta SET value=? WHERE key='next_poll_offset'")
+          .run(offset.canonical);
+      }
+      this.database.exec(`
+        ALTER TABLE prompt_bindings
+          ADD COLUMN generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0);
+        ALTER TABLE outbox
+          ADD COLUMN prompt_generation INTEGER CHECK(prompt_generation IS NULL OR prompt_generation >= 0);
+        CREATE TABLE flow_runs(
+          job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+          bundle_json TEXT NOT NULL,
+          flow_id TEXT NOT NULL,
+          node_id TEXT NOT NULL,
+          state_json TEXT NOT NULL,
+          revision INTEGER NOT NULL CHECK(revision >= 0),
+          transitions INTEGER NOT NULL CHECK(transitions >= 0),
+          prompt_generation INTEGER NOT NULL CHECK(prompt_generation >= 0),
+          wait_deadline INTEGER,
+          job_deadline INTEGER
+        ) STRICT;
+        CREATE TABLE session_facts(
+          session_id TEXT NOT NULL,
+          owner_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          value_json TEXT NOT NULL,
+          source_json TEXT NOT NULL,
+          flow_version TEXT,
+          bank_version TEXT,
+          created_at INTEGER NOT NULL,
+          provenance TEXT NOT NULL CHECK(provenance = 'user_confirmed'),
+          PRIMARY KEY(session_id, kind),
+          FOREIGN KEY(session_id, owner_id) REFERENCES sessions(id, owner_id)
+        ) STRICT;
+        CREATE TABLE pi_sessions(
+          session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+          pi_session_id TEXT NOT NULL UNIQUE,
+          file_path TEXT NOT NULL UNIQUE
+        ) STRICT;
+        CREATE TABLE outbox_cancellations(
+          outbox_id TEXT PRIMARY KEY REFERENCES outbox(id),
+          reason TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        ) STRICT;
+        CREATE INDEX outbox_cancellations_created ON outbox_cancellations(created_at);
+        PRAGMA user_version = ${String(SCHEMA_VERSION)};
+      `);
+      this.database.exec('COMMIT');
+    } catch {
+      try {
+        this.database.exec('ROLLBACK');
+      } catch {
+        // Preserve the stable migration classification.
+      }
+      throw new Error('Controller database migration failed.');
+    }
   }
 
   private allocateSequence(sessionId: string): number {
@@ -775,6 +1051,7 @@ export class ControllerStore {
     body: string,
     prefix?: string,
     chatId?: string,
+    promptGeneration: number | null = null,
   ): void {
     const row =
       sessionId === null
@@ -815,8 +1092,8 @@ export class ControllerStore {
       this.database
         .prepare(
           `INSERT INTO outbox(id, batch_id, session_id, job_id, kind, chunk_index, text, chat_id,
-                              status, attempts, next_attempt_at, created_at, delivered_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, NULL)`,
+                              status, attempts, next_attempt_at, created_at, delivered_at, prompt_generation)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, NULL, ?)`,
         )
         .run(
           this.id('out'),
@@ -829,6 +1106,7 @@ export class ControllerStore {
           deliveryChatId,
           now,
           now,
+          promptGeneration,
         );
     }
   }
@@ -952,10 +1230,37 @@ export class ControllerStore {
     );
   }
 
-  private closePrompts(jobId: string): void {
+  deactivatePrompts(
+    jobId: string,
+    reason: 'PROMPT_SUPERSEDED' | 'JOB_TERMINAL' | 'SERVER_RESTART',
+  ): void {
+    this.cancelPendingPrompts(jobId, reason);
     this.database
       .prepare('UPDATE prompt_bindings SET active=0 WHERE job_id=?')
       .run(jobId);
+  }
+
+  cancelPendingPrompts(
+    jobId: string,
+    reason: 'PROMPT_SUPERSEDED' | 'JOB_TERMINAL' | 'SERVER_RESTART',
+  ): number {
+    const pending = this.database
+      .prepare(
+        "SELECT id FROM outbox WHERE job_id=? AND kind='prompt' AND status='PENDING'",
+      )
+      .all(jobId) as { id: unknown }[];
+    const insert = this.database.prepare(
+      'INSERT INTO outbox_cancellations(outbox_id, reason, created_at) VALUES (?, ?, ?) ON CONFLICT(outbox_id) DO NOTHING',
+    );
+    const now = this.now();
+    for (const row of pending) {
+      insert.run(asString(row.id, 'outbox id'), reason, now);
+    }
+    return pending.length;
+  }
+
+  private closePrompts(jobId: string): void {
+    this.deactivatePrompts(jobId, 'JOB_TERMINAL');
   }
 
   private countRunning(): number {
@@ -992,6 +1297,43 @@ export function splitMessage(prefix: string, body: string): readonly string[] {
   }
   if (current.length > prefix.length || parts.length === 0) parts.push(current);
   return parts;
+}
+
+function readPollMetadata(
+  database: DatabaseSync,
+  version: number,
+): { readonly canonical: string; readonly legacy: boolean } {
+  const row = database
+    .prepare("SELECT value FROM meta WHERE key='next_poll_offset'")
+    .get() as { value?: unknown } | undefined;
+  const parsed = parsePollOffset(
+    row?.value,
+    version === PREVIOUS_SCHEMA_VERSION,
+  );
+  if (parsed === null)
+    throw new Error('Controller database metadata is incomplete.');
+  return parsed;
+}
+
+function parsePollOffset(
+  raw: unknown,
+  allowLegacy: boolean,
+): { readonly canonical: string; readonly legacy: boolean } | null {
+  if (typeof raw !== 'string') return null;
+  let integerPart: string;
+  let legacy = false;
+  const canonicalMatch = /^[0-9]+$/.exec(raw);
+  if (canonicalMatch?.[0] === raw) {
+    integerPart = raw;
+  } else {
+    const match = allowLegacy ? /^([0-9]+)\.0+$/.exec(raw) : null;
+    if (match?.[0] !== raw || match[1] === undefined) return null;
+    integerPart = match[1];
+    legacy = true;
+  }
+  const exact = BigInt(integerPart);
+  if (exact > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return { canonical: exact.toString(), legacy };
 }
 
 function jobPrefix(job: JobRecord): string {
